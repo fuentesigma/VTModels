@@ -111,7 +111,7 @@ This code requires:
 - `wandb`
 - `scikit-learn`
 
-Ensure you have a GPU or Apple M1/M2 chip for efficient training.
+Ensure you have a GPU or Apple silicon chip for efficient training.
 
 ---
 
