@@ -17,8 +17,89 @@ The training workflow consists of the following steps:
 
 ## File Summary
 
-### `dataCleaner.py`
-This script processes the raw ECG data and converts it into HDF5 files compatible with the training model. It handles segmenting, resampling, and formatting.
+### `dataCleaner.py`: ECG Preprocessing and Segmentation
+
+This script is the **first step** in the VTATTEND pipeline. It processes raw ECG signal data and associated annotations into a clean, downsampled, and trimmed dataset suitable for training. The final output is written in HDF5 format.
+
+---
+
+- ECG waveform files in plain text, expected to follow the naming format:  
+  `<PatientID>-<RecordingID>.txt` (e.g., `12.txt`)
+  
+- Annotation files for each recording, named as:  
+  `<PatientID>-<RecordingID>_RPointProperty.txt`
+
+The script assumes all raw data files are located in the folder defined by the variable `input_folder`.  
+You must modify this variable to point to the correct local path where your dataset resides.
+
+```python
+input_folder = "/path/to/raw/ECG-data"
+```
+
+---
+
+1. **Loads ECG waveform data** using a 12-lead configuration.
+2. **Cleans each ECG signal** via the `ECGProcessor` class from `ecgCleaner.py`:
+   - Currently, wavelet denoising is applied.
+3. **Loads beat annotations** (labels such as N, V, F, etc.).
+4. **Aligns annotations with ECG time series** using `pandas.merge_asof`.
+5. **Identifies ventricular tachycardia (VT) episodes** using simple clinical rules:
+   - At least 3 consecutive ‘V’ beats within a heart rate > 100 bpm.
+6. **Trims the recording** to a window: 2 hours before VT onset and 20 minutes after VT termination.
+7. **Downsamples the ECG** to reduce storage and compute cost.
+8. **Normalises the ECG** (zero mean, unit variance per lead).
+9. **Stores the result in an HDF5 file** containing:
+   - Time vector
+   - Normalised ECG matrix (12 leads)
+   - Binary VT label vector (0 = no VT, 1 = VT)
+
+---
+
+The cleaned and labelled data are saved under a standardised folder:
+
+```bash
+VT-data/Patient_<PatientID>.h5
+```
+
+Each `.h5` file contains a dataset named `"data"` with shape `(T, 14)`, where:
+- First column: time (in seconds)
+- Columns 1–12: ECG channels (leads I, II, III, aVR, aVL, aVF, V1–V6)
+- Last column: VT label (0 or 1)
+
+This folder is automatically created if it does not exist. All downstream scripts (`beatbot.py`, `warning.py`) expect data to be in this location.
+
+---
+
+From the command line:
+
+```bash
+python dataCleaner.py
+```
+
+This script will:
+- Automatically detect all patients based on the file naming convention
+- Process the entire cohort in parallel using 4 processes
+- Print messages for each processed file or if no VT episode was found
+
+---
+
+An optional visualisation function `visdebugger(patient_id)` is included, allowing inspection of ECG snippets around VT onset.  
+This helps verify whether episodes have been correctly detected and labelled.
+
+The script is deterministic and may be safely rerun after modifying:
+- The ECG cleaning pipeline (e.g., filtering or masking)
+- The VT detection criteria
+- The `input_folder` path
+
+To regenerate everything from scratch, simply delete the `VT-data` folder and rerun the script.
+
+---
+
+### ⚠️
+
+- The definition of a VT episode is conservative and based on standard arrhythmia rules. Adjust the logic in `labelling()` if needed.
+- If no VT episode is found for a patient, the file will be skipped.
+- ECGs are assumed to be sampled at 128 Hz; change `fs` in `Bucket` or `Glypho` classes if different.
 
 **Run this first.** It must be executed before any model training can take place.
 
