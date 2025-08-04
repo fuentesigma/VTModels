@@ -1,4 +1,4 @@
-# VTATTEND: Ventricular Tachycardia Early Warning System
+# Ventricular Tachycardia Early Warning System
 
 This repository implements a pipeline for training a deep learning model, **VTATTEND**, designed for early prediction of ventricular tachycardia (VT) using multi-lead ECG time series data. The project includes data preprocessing, outlier handling, self-supervised pretraining, model training, and final evaluation.
 
