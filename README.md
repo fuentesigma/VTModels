@@ -50,9 +50,61 @@ The main training script. It includes:
 ---
 
 ### `warning.py`
-Performs inference using a trained model and evaluates early warnings.
 
-**Run this after training is complete**, on the evaluation patient, to simulate deployment.
+**Run this after training is complete**, on the evaluation patients, to simulate deployment.
+
+This script simulates real-time prediction on unseen ECG data using the best trained model checkpoint. It evaluates whether the model is capable of **raising early alarms** before the clinical onset of ventricular tachycardia (VT). It also provides interpretability via performance metrics, ROC curves, confusion matrices, and probability timelines.
+
+---
+
+Once the model has been trained (via `beatbot.py`), this script:
+
+- Loads the best configuration (from `best_cfg.json` or Weights & Biases)
+- Instantiates the model with the best hyperparameters
+- Loads the trained model weights (`best_VTATTEND.pth`)
+- Retrieves the test cohort for inference
+- Generates smoothed probability outputs for each ECG window
+- Detects if and when the predicted probability crosses a decision threshold for a sustained period (**dwell time**)
+- Computes lead time, ROC AUC, confusion matrix, and standard classification metrics
+- Produces visualisations for diagnostic and validation purposes
+
+---
+
+The logic is encapsulated in two classes:
+
+- **`RingRing`**: Core inference and alarm detection logic. It performs sliding window inference, prediction smoothing, and finds sustained probability crossings.
+- **`Monitor`**: Inherits from `RingRing` and adds diagnostic tools like accuracy, precision, F1-score, lead time computation, equilibrium threshold plotting (`eqpoint`), and a visual summary (`report`).
+
+The script ends with a `main()` function that:
+
+1. Loads the test set
+2. Loads the model and weights
+3. Runs the `Monitor.report()` method with a fixed threshold (default `0.37`)
+4. Displays and saves diagnostic plots
+
+---
+
+Once `beatbot.py` has finished training:
+
+```bash
+python warning.py
+```
+
+This will evaluate the model on the test cohort and generate:
+
+- A time series plot of predicted probabilities and true labels
+- Onset and alarm times in `HH:MM:SS`
+- ROC curve with AUC
+- Confusion matrix heatmap
+- A saved report as `eqpoint_point.pdf` (and optionally `report.pdf`)
+
+If no alarms are raised or onset is undefined, it will report `None` for those entries.
+
+- Default threshold is `0.37` and dwell time is 10 seconds.
+- The smoothing window is Gaussian with σ = 30 seconds (converted to window units).
+- Input data is expected in `.h5` format, preprocessed by `dataCleaner.py`.
+- The script uses Apple MPS or CUDA if available, otherwise falls back to CPU.
+
 
 ---
 
