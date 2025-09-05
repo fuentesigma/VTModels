@@ -3,9 +3,12 @@ import glob
 import h5py
 import numpy as np
 # //////////////////////////////////////////////////////////////////////////
-import wandb
 import warnings
 import multiprocessing
+# //////////////////////////////////////////////////////////////////////////
+import optuna
+from optuna.samplers import TPESampler
+from optuna.pruners import MedianPruner
 # //////////////////////////////////////////////////////////////////////////
 import torch
 import torch.nn as nn
@@ -324,11 +327,6 @@ class Cardiobot:
         # ////////////////////////////////////////////////////////////////////////////////////
         print(f"Epoch {epoch_index + 1}/{self.num_epochs} Training Loss: {epoch_loss:.6f}")
         # ////////////////////////////////////////////////////////////////////////////////////
-
-        # Log to W&B
-        step = getattr(self, 'step_offset', 0) + epoch_index + self.pre_epochs
-        wandb.log({"train_loss": epoch_loss}, step=step)
-
         return epoch_loss
 
     def validate_epoch(self, epoch_index):
@@ -366,16 +364,6 @@ class Cardiobot:
 
         # Compute precision, recall, f1
         precision, recall, f1, _ = precision_recall_fscore_support(true_list, pred_list, average='binary', zero_division=0)
-
-        # Log to W&B
-        step = getattr(self, 'step_offset', 0) + epoch_index + self.pre_epochs
-        wandb.log({
-            "val_loss": epoch_loss,
-            "precision": precision,
-            "recall": recall,
-            "f1_score": f1
-        }, step=step)
-
         return epoch_loss
 
     def pretrain_epoch(self, epoch_index):
@@ -466,7 +454,7 @@ class Cardiobot:
 # ----------------------------------------------------------------------------------/
 class Pipeline:
     def __init__(self):
-        # Initialise wandb for experiment tracking with sensible defaults
+        # Initialise grid for experiment tracking with sensible defaults
         self.config = {
             "channel_sizes": [[16, 32, 64], [32, 64, 128], [64, 128, 256]],
             "kernel_size": 3,
@@ -478,99 +466,81 @@ class Pipeline:
             "weight_decay": 1e-4,
         }
 
-    def objective(self):
-        # Initialise wandb with the current run
-        wandb.init(project="VTATTEND", config=self.config)
+    def objective(self, trial):
+        # Suggest hyperparameters
+        _channel_sizes_opts = ((16, 32, 64), (32, 64, 128), (64, 128, 256))
+        _cs_ix = trial.suggest_categorical("channel_sizes_ix", list(range(len(_channel_sizes_opts))))
+        channel_sizes = list(_channel_sizes_opts[_cs_ix])
+        kernel_size = trial.suggest_categorical("kernel_size", [3, 5, 7])
+        num_heads = trial.suggest_categorical("num_heads", [2, 4, 8])
+        dropout = trial.suggest_float("dropout", 0.3, 0.7)
+        learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+        weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+        horizon = trial.suggest_categorical("horizon", [160, 320, 480])
+        patience = trial.suggest_categorical("patience", [2, 3, 5])
 
-        # Prepare cross-validation on patient files
         files = [f"VT-data/Patient_{pid}.h5" for pid in remaining]
         groups = remaining
 
         kf = GroupKFold(n_splits=5)
         validation_losses = []
 
-        # :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
         for fold, (train_idx, val_idx) in enumerate(kf.split(files, groups=groups)):
-            # Indicate current fold
             print(f"Starting cross-validation fold {fold + 1}/{kf.n_splits}")
-
-            # Extract train and validation files for this fold
             train_files = [files[i] for i in train_idx]
             validation_files = [files[i] for i in val_idx]
 
-            # Instantiate train dataset, sampler and loader
             train_loader = BeatHarvest(
                 train_files,
                 SLIDING_WINDOW,
-                wandb.config.horizon,
-                wandb.config.batch_size
-                ).push()
+                horizon,
+                batch_size
+            ).push()
 
-            # Instantiate validation dataset, sampler and loader
             validation_loader = BeatHarvest(
                 validation_files,
                 SLIDING_WINDOW,
-                wandb.config.horizon,
-                wandb.config.batch_size
-                ).push()
+                horizon,
+                batch_size
+            ).push()
 
-            # Determine input dimensionality from dataset
-            wandb.config.input_dim = input_dim
-
-            # Fresh model per fold 
             model = VTATTEND(
                 input_dim=input_dim,
-                channel_sizes=wandb.config.channel_sizes,
-                kernel_size=wandb.config.kernel_size,
-                num_heads=wandb.config.num_heads,
-                dropout=wandb.config.dropout,
-                horizon=wandb.config.horizon
+                channel_sizes=channel_sizes,
+                kernel_size=kernel_size,
+                num_heads=num_heads,
+                dropout=dropout,
+                horizon=horizon
             )
-            
-            # Use wandb to log the model architecture
-            wandb.watch(model, log="all", log_freq=100)
 
-            # Load trainer with current fold's data
             trainer = Cardiobot(
-                model, 
-                train_loader, 
-                validation_loader, 
-                lr=wandb.config.learning_rate, 
-                weight_decay=wandb.config.weight_decay
-                )
-            
-            trainer.step_offset = fold * wnb_epochs
-            
-            # Perform training with early stopping
-            trainer.fit(num_epochs=wnb_epochs, pre_epochs=0, patience=wnb_epochs//4, ssl=False)
+                model,
+                train_loader,
+                validation_loader,
+                lr=learning_rate,
+                weight_decay=weight_decay
+            )
 
-            # Evaluate on validation fold
-            validation_loss = trainer.validate_epoch(wnb_epochs - 1)
+            # Train with early stopping
+            trainer.fit(num_epochs=wnb_epochs, pre_epochs=0, patience=patience, ssl=False)
+
+            # Evaluate on the current validation split
+            validation_loss = trainer.validate_epoch(0)
             validation_losses.append(validation_loss)
 
-            # Report validation loss for this fold
-            print(f"Fold {fold + 1} validation loss: {validation_loss:.6f}")
+            # Intermediate report to enable pruning
+            trial.report(validation_loss, step=fold)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
 
-        # Return wandb
         avg_val_loss = sum(validation_losses) / len(validation_losses)
-        wandb.log({"avg_val_loss": avg_val_loss})
-
-        return
+        return avg_val_loss
 
     def fulltrain(self, best_cfg):
-        # Initialise a new W&B run for final training
-        wandb.init(
-            project=os.getenv("WANDB_PROJECT", "VTATTEND_final"), 
-            entity=os.getenv("WANDB_ENTITY", "jfuentesaguilar"),
-            config=best_cfg,
-            reinit=True
-            )
-
-        # Load full training sets
         train_loader = BeatHarvest(trainCohort, SLIDING_WINDOW, best_cfg["horizon"], best_cfg["batch_size"]).push()
         validation_loader = BeatHarvest(validationCohort, SLIDING_WINDOW, best_cfg["horizon"], best_cfg["batch_size"]).push()
 
-        # Instantiate model with best hyperparameters
         model = VTATTEND(
             input_dim=input_dim,
             channel_sizes=best_cfg["channel_sizes"],
@@ -580,72 +550,51 @@ class Pipeline:
             horizon=best_cfg["horizon"]
         )
 
-        # Final training pass
         trainer = Cardiobot(
-            model, 
-            train_loader=train_loader, 
-            val_loader=validation_loader, 
-            lr=best_cfg["learning_rate"], 
+            model,
+            train_loader=train_loader,
+            val_loader=validation_loader,
+            lr=best_cfg["learning_rate"],
             weight_decay=best_cfg["weight_decay"]
-            )
-        
+        )
+
         trainer.fit(num_epochs=num_epochs, pre_epochs=ssl_epochs, patience=num_epochs//4, ssl=True)
 
-        # Save final model
         torch.save(model.state_dict(), "best_VTATTEND.pth")
         print("Final model saved as 'best_VTATTEND.pth'")
 
-        # Finish the W&B run
-        wandb.finish()
-
     def controlpanel(self):
-        # Check if the script is being run as the main module
         multiprocessing.freeze_support()
-
-        # Set the multiprocessing start method to spawn
         if multiprocessing.current_process().name == "MainProcess":
-            # Sweep setup and agent launch
-            sweep_config = {
-                "method": "bayes",
-                "metric": {"name": "avg_val_loss", "goal": "minimize"},
-                "parameters": {
-                    "channel_sizes": {"values": [[16, 32, 64], [32, 64, 128], [64, 128, 256]]},
-                    "kernel_size": {"values": [3, 5, 7]},
-                    "num_heads": {"values": [2, 4, 8]},
-                    "dropout": {"min": 0.3, "max": 0.7},
-                    "learning_rate": {"distribution": "log_uniform_values", "min": 1e-5, "max": 1e-3},
-                    "weight_decay": {"distribution": "log_uniform_values", "min": 1e-6, "max": 1e-3},
-                    "batch_size": {"values": [16, 32, 64]},
-                    "horizon": {"values": [160, 320, 480]},
-                    "patience": {"values": [2, 3, 5]}
-                }
+            n_trials = int(os.getenv("OPTUNA_TRIALS", "30"))
+            sampler = TPESampler(seed=42)
+            pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=0)
+            study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
+            study.optimize(self.objective, n_trials=n_trials, show_progress_bar=False)
+
+            print("Best hyperparameters found:")
+            print(study.best_trial.params)
+
+            # Reconstruct channel_sizes from stored index
+            _channel_sizes_opts = ((16, 32, 64), (32, 64, 128), (64, 128, 256))
+            _best_cs = list(_channel_sizes_opts[study.best_trial.params["channel_sizes_ix"]])
+
+            # Build best config for final training
+            best_cfg = {
+                "channel_sizes": _best_cs,
+                "kernel_size": study.best_trial.params["kernel_size"],
+                "num_heads": study.best_trial.params["num_heads"],
+                "dropout": study.best_trial.params["dropout"],
+                "horizon": study.best_trial.params["horizon"],
+                "batch_size": study.best_trial.params["batch_size"],
+                "learning_rate": study.best_trial.params["learning_rate"],
+                "weight_decay": study.best_trial.params["weight_decay"],
             }
 
-            # Initialise wandb sweep
-            sweep_id = wandb.sweep(
-                sweep_config,
-                project=os.getenv("WANDB_PROJECT", "VTATTEND_"),
-                entity=os.getenv("WANDB_ENTITY", "jfuentesaguilar")
-            )
-
-            # Launch the sweep agent
-            wandb.agent(sweep_id, function=self.objective, count=50)
-
-            # After sweep completes, fetch best run and perform final training + evaluation
-            api = wandb.Api()
-            project = os.getenv("WANDB_PROJECT", "VTATTEND_")
-            entity = os.getenv("WANDB_ENTITY", "jfuentesaguilar")
-            sweep = api.sweep(f"{entity}/{project}/{sweep_id}")
-
-            # Get the best run based on validation loss
-            best_run = min(sweep.runs, key=lambda run: run.summary["val_loss"])
-
-            print("Best hyperparameters found:", best_run.config)
-            self.fulltrain(best_run.config)
+            self.fulltrain(best_cfg)
 
     def debug(self):
         print("Debug mode.")
-        
         debug_config = {
             "channel_sizes": [16, 32, 64],
             "kernel_size": 3,
@@ -657,13 +606,6 @@ class Pipeline:
             "weight_decay": 1e-4
         }
 
-        wandb.init(
-            project=os.getenv("WANDB_PROJECT", "VTATTEND_debug"),
-            entity=os.getenv("WANDB_ENTITY", "jfuentesaguilar"),
-            config=debug_config,
-            reinit=True
-        )
-
         debug_loader = BeatHarvest(trainCohort, SLIDING_WINDOW, debug_config["horizon"], debug_config["batch_size"]).push()
 
         debug_model = VTATTEND(
@@ -673,20 +615,17 @@ class Pipeline:
             num_heads=debug_config["num_heads"],
             dropout=debug_config["dropout"],
             horizon=debug_config["horizon"]
-            )
-        
+        )
+
         debug_trainer = Cardiobot(
-            debug_model, 
-            debug_loader, 
-            debug_loader, 
-            lr=debug_config["learning_rate"], 
+            debug_model,
+            debug_loader,
+            debug_loader,
+            lr=debug_config["learning_rate"],
             weight_decay=debug_config["weight_decay"]
-            )
-        
+        )
+
         debug_trainer.fit(num_epochs=10, pre_epochs=10, patience=0, ssl=True)
-        
-        wandb.finish()
-        
         return
 
 # ---------------------------------------------------------------------------------/
