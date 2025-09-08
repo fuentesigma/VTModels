@@ -2,13 +2,14 @@ import os
 import glob
 import h5py
 import numpy as np
+import json
 # //////////////////////////////////////////////////////////////////////////
 import warnings
 import multiprocessing
 # //////////////////////////////////////////////////////////////////////////
 import optuna
 from optuna.samplers import TPESampler
-from optuna.pruners import MedianPruner
+from optuna.pruners import MedianPruner, SuccessiveHalvingPruner, HyperbandPruner
 # //////////////////////////////////////////////////////////////////////////
 import torch
 import torch.nn as nn
@@ -20,6 +21,8 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, get_wor
 from sklearn.model_selection import GroupKFold
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support
+import matplotlib.pyplot as plt
+import csv
 # //////////////////////////////////////////////////////////////////////////
 """
     * P A T I E N T S *
@@ -56,21 +59,81 @@ SLIDING_WINDOW = int(15 * 32)
 input_dim = 12
 num_epochs = 100    # Number of epochs for final training
 ssl_epochs = 20     # Number of epochs for pre-training
-wnb_epochs = 20     # Number of epochs for fine-tuning
+ft_epochs = 20      # Number of epochs for fine-tuning
+
+# -------------------------------------------------------------------------
+# Recommended sweep/runtime defaults
+os.environ.setdefault("OPTUNA_TRIALS", "20")
+os.environ.setdefault("OPTUNA_FOLDS", "3")
+os.environ.setdefault("OPTUNA_EPOCHS", "12")
+# NOTE: I intentionally do NOT set a default for MAX_SAMPLES_PER_EPOCH; leaving it unset uses the full dataset per epoch.
+# -------------------------------------------------------------------------
+
+# ECG lead maps (consistent with dataCleaner.py: ecg_leads)
+ECG_LEADS = ["i (mV)", "ii (mV)", "iii (mV)", "avr (mV)", "avl (mV)", "avf (mV)", "v1 (mV)", "v2 (mV)", "v3 (mV)", "v4 (mV)", "v5 (mV)", "v6 (mV)"]
+
+# HDF5 column mapping for dataset f["data"]:
+H5_COL_MAP = {"time": 0, **{name: i + 1 for i, name in enumerate(ECG_LEADS)}, "vt": 13}
+
+# For selecting channels in BeatHarvest:
+LEAD_TO_1BASED = {name: i + 1 for i, name in enumerate(ECG_LEADS)}
+LEAD_TO_0BASED_SLICE = {name: i for i, name in enumerate(ECG_LEADS)}
+INDEX1_TO_NAME = {i + 1: name for i, name in enumerate(ECG_LEADS)}
+INDEX0_TO_NAME = {i: name for i, name in enumerate(ECG_LEADS)}
+
+def lead2channel(names, one_based=True):
+    """Convert a list of lead names to BeatHarvest.channels indices."""
+    lut = LEAD_TO_1BASED if one_based else LEAD_TO_0BASED_SLICE
+    try:
+        return [lut[name] for name in names]
+    except KeyError as e:
+        raise KeyError(f"Unknown lead name: {e.args[0]}. Expected one of {list(lut.keys())}")
+
+def channel2lead(channels, one_based=True):
+    """Convert BeatHarvest.channels indices back to lead names."""
+    lut = INDEX1_TO_NAME if one_based else INDEX0_TO_NAME
+    try:
+        return [lut[i] for i in channels]
+    except KeyError as e:
+        raise KeyError(f"Bad channel index: {e.args[0]}. "
+                       f"Use 1..12 if one_based=True, else 0..11.")
+
+channels = lead2channel(["ii (mV)", "v1 (mV)", "v5 (mV)"], one_based=True)
 
 # ---------------------------------------------------------------------------------/
 class BeatHarvest(Dataset):
-    def __init__(self, files, sliding_window=320, horizon=320, batch_size=16, overlap=0.25, num_workers=4):
+    def __init__(self, files, sliding_window=320, horizon=320, batch_size=16, overlap=0.25, num_workers=4, channels=None, samples_per_epoch=None):
         self.files = files
         self.sliding_window = sliding_window
         self.horizon = horizon
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.samples_per_epoch = samples_per_epoch
+
+        # Optional channel selection (relative to columns 1..12 in the HDF5)
+        self.channels = channels
+        if channels is None:
+            self.channel_idx = None
+            self.n_channels = 12
+        else:
+            if not hasattr(channels, "__iter__"):
+                raise ValueError("channels must be an iterable of integers or None")
+            if all(isinstance(c, int) for c in channels):
+                if all(1 <= c <= 12 for c in channels):
+                    # convert 1-based leads (1..12) to 0-based indices (0..11)
+                    self.channel_idx = [c - 1 for c in channels]
+                elif all(0 <= c <= 11 for c in channels):
+                    self.channel_idx = list(channels)
+                else:
+                    raise ValueError("Channel indices must be in 0..11 (0-based) or 1..12 (1-based).")
+                self.n_channels = len(self.channel_idx)
+            else:
+                raise ValueError("channels must contain integers")
 
         if not (0 <= overlap < 1):
             raise ValueError("Overlap must lie in [0,1).")
         self.step_size = int(sliding_window * (1 - overlap))
-
+        
         if self.step_size <= 0:
             raise ValueError("Step size must be positive.")
 
@@ -92,7 +155,8 @@ class BeatHarvest(Dataset):
             sampler=self.sampler,
             num_workers=self.num_workers,
             pin_memory=True,
-            worker_init_fn=self._worker_init_fn
+            worker_init_fn=self._worker_init_fn,
+            persistent_workers=(self.num_workers > 0)
         )
 
     def loader(self):
@@ -103,23 +167,37 @@ class BeatHarvest(Dataset):
 
     def atlas(self):
         for fidx, meta in enumerate(self.file_metas):
-
             length = meta['length']
             max_start = length - self.sliding_window - self.horizon
             
             if max_start < 0:
                 continue
+
+            # Open once per file and read only the VT label column (index 13)
+            with h5py.File(meta['file_path'], 'r', libver='latest', swmr=True) as f:
+                vt_col = f['data'][:, 13]
+
+            # Binarise and compute a rolling 'any VT in next horizon' vector
+            vt_bin = (vt_col == 1).astype(np.uint8)
             
-            for start in range(0, max_start + 1, self.step_size):
+            # Starts look at future window beginning at start + sliding_window
+            # Build a view that covers all needed positions for convolution
+            future = vt_bin[self.sliding_window : self.sliding_window + max_start + self.horizon]
+            if self.horizon > 0:
+                kernel = np.ones(self.horizon, dtype=np.uint8)
+                conv = np.convolve(future, kernel, mode='valid')  # length max_start + 1
+                labels_all = (conv > 0).astype(np.uint8)
+            else:
+                labels_all = np.zeros(max_start + 1, dtype=np.uint8)
 
-                with h5py.File(meta['file_path'], 'r', libver='latest', swmr=True) as f:
-                    data = f['data'][:]
-                    vt_future = data[start + self.sliding_window : start + self.sliding_window + self.horizon, 13]
-                
-                label = int(np.any(vt_future == 1))
+            # Subsample by step_size without per-start file I/O
+            starts = np.arange(0, max_start + 1, self.step_size, dtype=int)
+            selected_labels = labels_all[starts]
 
-                self.indices.append((fidx, start))
-                self.sample_labels.append(label)
+            # Record indices and labels
+            for s, lab in zip(starts, selected_labels):
+                self.indices.append((fidx, int(s)))
+                self.sample_labels.append(int(lab))
 
         if len(self.indices) == 0:
             raise ValueError("No valid windows were generated.")
@@ -137,11 +215,12 @@ class BeatHarvest(Dataset):
         w_neg = 1.0 / (count_neg + 1e-6)
         weights = np.where(labels == 1, w_pos, w_neg)
         
-        return WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
+        num = len(weights) if not self.samples_per_epoch else min(int(self.samples_per_epoch), len(weights))
+        return WeightedRandomSampler(weights=weights, num_samples=num, replacement=True)
 
     def __getitem__(self, idx):
         fidx, start = self.indices[idx]
-
+        
         if fidx not in self._h5_files:
             file_path = self.file_metas[fidx]['file_path']
             self._h5_files[fidx] = h5py.File(file_path, 'r', libver='latest', swmr=True)
@@ -149,6 +228,8 @@ class BeatHarvest(Dataset):
         f = self._h5_files[fidx]
         data = f['data']
         ecg = data[start : start + self.sliding_window, 1:13]
+        if self.channel_idx is not None:
+            ecg = ecg[:, self.channel_idx]
 
         x = torch.as_tensor(ecg, dtype=torch.float32)
         y = torch.as_tensor([self.sample_labels[idx]], dtype=torch.float32)
@@ -282,12 +363,19 @@ class Cardiobot:
         self.epochs_no_improve = 0
         self.early_stop = False
 
+        # Number of channels used by the dataset
+        self.n_channels = getattr(self.train_loader.dataset, 'n_channels', 12)
+
+        # AMP (mixed precision) setup
+        self.amp_enabled = torch.cuda.is_available()
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
+
         # Self-supervised components
         self.mask_ratio = 0.3
         # model.attention.embed_dim holds the sequence embedding dimension
         d_model = self.model.attention.embed_dim
-        # Decoder: project from sequence embeddings back to 12-lead ECG
-        self.pre_decoder = nn.Linear(d_model, 12).to(self.device)
+        # Decoder: project from sequence embeddings back to n-lead ECG
+        self.pre_decoder = nn.Linear(d_model, self.n_channels).to(self.device)
         # MSE loss for reconstruction
         self.pre_criterion = nn.MSELoss()
         # Optimiser for encoder+decoder during SSL
@@ -308,13 +396,16 @@ class Cardiobot:
             ecg = ecg.to(self.device)
             labels = labels.to(self.device)
 
-            logits = self.model(ecg)
-            loss = self.criterion(logits, labels)
+            with torch.amp.autocast("cuda", enabled=self.amp_enabled):
+                logits = self.model(ecg)
+                loss = self.criterion(logits, labels)
 
-            self.optimiser.zero_grad()
-            loss.backward()
+            self.optimiser.zero_grad(set_to_none=True)
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimiser)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimiser.step()
+            self.scaler.step(self.optimiser)
+            self.scaler.update()
 
             running_loss += loss.item()
             num_batches += 1
@@ -328,7 +419,7 @@ class Cardiobot:
         print(f"Epoch {epoch_index + 1}/{self.num_epochs} Training Loss: {epoch_loss:.6f}")
         # ////////////////////////////////////////////////////////////////////////////////////
         return epoch_loss
-
+    
     def validate_epoch(self, epoch_index):
         """
         Supervised validation for one epoch.
@@ -344,8 +435,9 @@ class Cardiobot:
                 ecg = ecg.to(self.device)
                 labels = labels.to(self.device)
 
-                logits = self.model(ecg)
-                loss = self.criterion(logits, labels)
+                with torch.amp.autocast("cuda", enabled=self.amp_enabled):
+                    logits = self.model(ecg)
+                    loss = self.criterion(logits, labels)
 
                 # Convert logits to probabilities and threshold for binary prediction
                 probs = torch.sigmoid(logits).view(-1)
@@ -365,6 +457,34 @@ class Cardiobot:
         # Compute precision, recall, f1
         precision, recall, f1, _ = precision_recall_fscore_support(true_list, pred_list, average='binary', zero_division=0)
         return epoch_loss
+    
+    def evaluate(self, data_loader):
+        self.model.eval()
+        running_loss = 0.0
+        num_batches = 0
+        true_list = []
+        pred_list = []
+
+        with torch.no_grad():
+            for ecg, labels in data_loader:
+                ecg = ecg.to(self.device)
+                labels = labels.to(self.device)
+
+                with torch.amp.autocast("cuda", enabled=self.amp_enabled):
+                    logits = self.model(ecg)
+                    loss = self.criterion(logits, labels)
+
+                probs = torch.sigmoid(logits).view(-1)
+                preds = (probs > 0.5).long()
+                pred_list.extend(preds.cpu().tolist())
+                true_list.extend(labels.cpu().view(-1).tolist())
+
+                running_loss += loss.item()
+                num_batches += 1
+
+        epoch_loss = running_loss / max(1, num_batches)
+        precision, recall, f1, _ = precision_recall_fscore_support(true_list, pred_list, average='binary', zero_division=0)
+        return {"val_loss": epoch_loss, "precision": precision, "recall": recall, "f1": f1}
 
     def pretrain_epoch(self, epoch_index):
         """
@@ -392,19 +512,18 @@ class Cardiobot:
             masked_ecg[mask_expanded] = 0.0
 
             # Obtain sequence embeddings (requires model to support return_sequence=True)
-            seq_embed = self.model(masked_ecg, return_sequence=True)
+            with torch.amp.autocast("cuda", enabled=self.amp_enabled):
+                seq_embed = self.model(masked_ecg, return_sequence=True)
+                # Decode back
+                recon = self.pre_decoder(seq_embed)
+                # Compute MSE on masked positions only
+                loss = self.pre_criterion(recon[mask_expanded], ecg[mask_expanded])
 
-            # Decode back
-            recon = self.pre_decoder(seq_embed)
-            # recon is (batch, seq_len, channels)
-
-            # Compute MSE on masked positions only
-            loss = self.pre_criterion(recon[mask_expanded], ecg[mask_expanded])
-
-            # Typical optimisation steps
-            self.pre_optimiser.zero_grad()
-            loss.backward()
-            self.pre_optimiser.step()
+            # Optimisation with AMP scaler
+            self.pre_optimiser.zero_grad(set_to_none=True)
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.pre_optimiser)
+            self.scaler.update()
 
             # Accumulate loss
             total_loss += loss.item()
@@ -418,7 +537,7 @@ class Cardiobot:
 
         return avg_loss
 
-    def fit(self, num_epochs, pre_epochs, patience, ssl=False):
+    def fit(self, num_epochs, pre_epochs, patience, ssl=False, trial=None, report_base_step=0, prune=True):
         self.num_epochs = num_epochs
         self.pre_epochs = pre_epochs
 
@@ -445,6 +564,14 @@ class Cardiobot:
             else:
                 lazy_epochs += 1
 
+            if trial is not None:
+                try:
+                    trial.report(val_loss, step=report_base_step + epoch)
+                    if prune and trial.should_prune():
+                        raise optuna.exceptions.TrialPruned()
+                except Exception:
+                    pass
+
             if lazy_epochs >= patience:
                 # //////////////////////////////////////////////////////////////
                 print(f"Early stopping at epoch {epoch + 1}.")
@@ -464,13 +591,26 @@ class Pipeline:
             "batch_size": 32,
             "learning_rate": 5e-5,
             "weight_decay": 1e-4,
+            "channels": None,
         }
 
     def objective(self, trial):
+
+        folds = int(os.getenv("OPTUNA_FOLDS", "3"))
+        epochs = int(os.getenv("OPTUNA_EPOCHS", "12"))
+
+        # REMINDER: export MAX_SAMPLES_PER_EPOCH=50000 to cap per-epoch work
+        samples_cap = int(os.getenv("MAX_SAMPLES_PER_EPOCH", "0"))
+        
+        if samples_cap <= 0:
+            samples_cap = None
+
         # Suggest hyperparameters
-        _channel_sizes_opts = ((16, 32, 64), (32, 64, 128), (64, 128, 256))
-        _cs_ix = trial.suggest_categorical("channel_sizes_ix", list(range(len(_channel_sizes_opts))))
-        channel_sizes = list(_channel_sizes_opts[_cs_ix])
+        channel_sizes_opts = ((16, 32, 64), (32, 64, 128), (64, 128, 256))
+
+        cs_ix = trial.suggest_categorical("channel_sizes_ix", list(range(len(channel_sizes_opts))))
+
+        channel_sizes = list(channel_sizes_opts[cs_ix])
         kernel_size = trial.suggest_categorical("kernel_size", [3, 5, 7])
         num_heads = trial.suggest_categorical("num_heads", [2, 4, 8])
         dropout = trial.suggest_float("dropout", 0.3, 0.7)
@@ -481,9 +621,10 @@ class Pipeline:
         patience = trial.suggest_categorical("patience", [2, 3, 5])
 
         files = [f"VT-data/Patient_{pid}.h5" for pid in remaining]
+        
         groups = remaining
-
-        kf = GroupKFold(n_splits=5)
+        
+        kf = GroupKFold(n_splits=folds)
         validation_losses = []
 
         for fold, (train_idx, val_idx) in enumerate(kf.split(files, groups=groups)):
@@ -495,18 +636,23 @@ class Pipeline:
                 train_files,
                 SLIDING_WINDOW,
                 horizon,
-                batch_size
+                batch_size,
+                channels=self.config.get("channels"),
+                samples_per_epoch=samples_cap
             ).push()
 
             validation_loader = BeatHarvest(
                 validation_files,
                 SLIDING_WINDOW,
                 horizon,
-                batch_size
+                batch_size,
+                channels=self.config.get("channels"),
+                samples_per_epoch=samples_cap
             ).push()
 
+            input_dim_local = train_loader.dataset.n_channels
             model = VTATTEND(
-                input_dim=input_dim,
+                input_dim=input_dim_local,
                 channel_sizes=channel_sizes,
                 kernel_size=kernel_size,
                 num_heads=num_heads,
@@ -522,27 +668,40 @@ class Pipeline:
                 weight_decay=weight_decay
             )
 
-            # Train with early stopping
-            trainer.fit(num_epochs=wnb_epochs, pre_epochs=0, patience=patience, ssl=False)
+            trainer.fit(num_epochs=epochs, pre_epochs=0, patience=patience, ssl=False, trial=trial, report_base_step=fold*epochs, prune=True)
 
-            # Evaluate on the current validation split
-            validation_loss = trainer.validate_epoch(0)
-            validation_losses.append(validation_loss)
-
-            # Intermediate report to enable pruning
-            trial.report(validation_loss, step=fold)
-            if trial.should_prune():
-                raise optuna.exceptions.TrialPruned()
+            m = trainer.evaluate(validation_loader)
+            validation_losses.append(m["val_loss"])
 
         avg_val_loss = sum(validation_losses) / len(validation_losses)
         return avg_val_loss
 
     def fulltrain(self, best_cfg):
-        train_loader = BeatHarvest(trainCohort, SLIDING_WINDOW, best_cfg["horizon"], best_cfg["batch_size"]).push()
-        validation_loader = BeatHarvest(validationCohort, SLIDING_WINDOW, best_cfg["horizon"], best_cfg["batch_size"]).push()
+        samples_cap = int(os.getenv("MAX_SAMPLES_PER_EPOCH", "0"))
+        if samples_cap <= 0:
+            samples_cap = None
+        train_loader = BeatHarvest(
+            trainCohort, 
+            SLIDING_WINDOW, 
+            best_cfg["horizon"], 
+            best_cfg["batch_size"], 
+            channels=self.config.get("channels"),
+            samples_per_epoch=samples_cap
+            ).push()
+        
+        validation_loader = BeatHarvest(
+            validationCohort, 
+            SLIDING_WINDOW, 
+            best_cfg["horizon"], 
+            best_cfg["batch_size"], 
+            channels=self.config.get("channels"),
+            samples_per_epoch=samples_cap
+            ).push()
+
+        input_dim_local = train_loader.dataset.n_channels
 
         model = VTATTEND(
-            input_dim=input_dim,
+            input_dim=input_dim_local,
             channel_sizes=best_cfg["channel_sizes"],
             kernel_size=best_cfg["kernel_size"],
             num_heads=best_cfg["num_heads"],
@@ -563,13 +722,146 @@ class Pipeline:
         torch.save(model.state_dict(), "best_VTATTEND.pth")
         print("Final model saved as 'best_VTATTEND.pth'")
 
+    def learning_curves(self, patient_counts=None, repeats=3, cfg=None, epochs=None, seed=42):
+        rng = np.random.default_rng(seed)
+        max_patients = len(trainCohort)
+        if patient_counts is None:
+            base = [5, 10, 20, 30]
+            patient_counts = sorted({n for n in base if n <= max_patients} | {max_patients})
+        else:
+            patient_counts = [n for n in patient_counts if n <= max_patients]
+            if len(patient_counts) == 0:
+                raise ValueError("No valid patient counts; all exceed available training patients.")
+
+        # Choose configuration
+        if cfg is None:
+            cfg = getattr(self, 'best_cfg', None) or self.config
+
+        # Epoch budget
+        epochs = int(epochs or min(ft_epochs, 20))
+        patience = max(2, epochs // 4)
+
+        # Storage
+        results = {n: {"val_loss": [], "precision": [], "recall": [], "f1": []} for n in patient_counts}
+
+        for n in patient_counts:
+            for r in range(repeats):
+                # Random subset of training patients (by file)
+                subset = rng.choice(trainCohort, size=n, replace=False)
+
+                samples_cap = int(os.getenv("MAX_SAMPLES_PER_EPOCH", "0"))
+                if samples_cap <= 0:
+                    samples_cap = None
+                # Build loaders
+                train_loader = BeatHarvest(
+                    list(subset), SLIDING_WINDOW, cfg.get("horizon", 320), cfg.get("batch_size", 32),
+                    channels=self.config.get("channels"),
+                    samples_per_epoch=samples_cap
+                ).push()
+
+                val_loader = BeatHarvest(
+                    validationCohort, SLIDING_WINDOW, cfg.get("horizon", 320), cfg.get("batch_size", 32),
+                    channels=self.config.get("channels"),
+                    samples_per_epoch=samples_cap
+                ).push()
+
+                # Model and trainer
+                input_dim_local = train_loader.dataset.n_channels
+                model = VTATTEND(
+                    input_dim=input_dim_local,
+                    channel_sizes=cfg.get("channel_sizes", [16, 32, 64]),
+                    kernel_size=cfg.get("kernel_size", 3),
+                    num_heads=cfg.get("num_heads", 4),
+                    dropout=cfg.get("dropout", 0.6),
+                    horizon=cfg.get("horizon", 320)
+                )
+
+                trainer = Cardiobot(
+                    model,
+                    train_loader,
+                    val_loader,
+                    lr=cfg.get("learning_rate", 5e-5),
+                    weight_decay=cfg.get("weight_decay", 1e-4)
+                )
+
+                # Short, early-stoppable training
+                trainer.fit(num_epochs=epochs, pre_epochs=0, patience=patience, ssl=False)
+
+                # Metrics on validation set
+                m = trainer.evaluate(val_loader)
+                for k in results[n].keys():
+                    results[n][k].append(m[k])
+
+                print(f"LC n={n} r={r+1}/{repeats}: F1={m['f1']:.3f}, loss={m['val_loss']:.4f}")
+
+        # Aggregate and save CSV
+        header = [
+            "patients", "repeats",
+            "val_loss_mean", "val_loss_std",
+            "precision_mean", "precision_std",
+            "recall_mean", "recall_std",
+            "f1_mean", "f1_std",
+        ]
+        rows = []
+        xs = []
+        f1_means, f1_stds = [], []
+        for n in patient_counts:
+            xs.append(n)
+            vals = results[n]
+            def _mean_std(a):
+                arr = np.asarray(a, dtype=float)
+                return float(np.nanmean(arr)), float(np.nanstd(arr))
+            vl_m, vl_s = _mean_std(vals["val_loss"])
+            p_m, p_s = _mean_std(vals["precision"])
+            r_m, r_s = _mean_std(vals["recall"])
+            f_m, f_s = _mean_std(vals["f1"])
+            rows.append([n, len(vals["f1"]), vl_m, vl_s, p_m, p_s, r_m, r_s, f_m, f_s])
+            f1_means.append(f_m)
+            f1_stds.append(f_s)
+
+        with open("learning_curve.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(rows)
+        print("Saved learning curve data to learning_curve.csv")
+
+        # Plot F1 learning curve with error bars
+        fig = plt.figure()
+        plt.errorbar(xs, f1_means, yerr=f1_stds, fmt='-o')
+        plt.xlabel('Number of training patients')
+        plt.ylabel('F1 score (validation)')
+        plt.title('Learning curve')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        fig.savefig('learning_curve_f1.png', dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print("Saved F1 learning curve to learning_curve_f1.png")
+
+        return {
+            "counts": xs,
+            "f1_mean": f1_means,
+            "f1_std": f1_stds,
+            "rows": rows
+        }
+
     def controlpanel(self):
+
         multiprocessing.freeze_support()
+        
+        # Only run Optuna in the main process
         if multiprocessing.current_process().name == "MainProcess":
-            n_trials = int(os.getenv("OPTUNA_TRIALS", "30"))
+            # Define number of trials from environment variable or default
+            n_trials = int(os.getenv("OPTUNA_TRIALS", "20"))
+
+            # Use TPE sampler and multi-fidelity pruner
             sampler = TPESampler(seed=42)
-            pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=0)
-            study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
+            
+            pruner = HyperbandPruner(min_resource=3, reduction_factor=3)
+            
+            # Create study
+            study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner, study_name="VTATTEND_Optuna")
+            
+            # Invoke optimisation
             study.optimize(self.objective, n_trials=n_trials, show_progress_bar=False)
 
             print("Best hyperparameters found:")
@@ -589,7 +881,15 @@ class Pipeline:
                 "batch_size": study.best_trial.params["batch_size"],
                 "learning_rate": study.best_trial.params["learning_rate"],
                 "weight_decay": study.best_trial.params["weight_decay"],
+                "channels": self.config.get("channels"),
             }
+            self.best_cfg = best_cfg
+            try:
+                with open("best_cfg.json", "w") as f:
+                    json.dump(best_cfg, f, indent=2)
+                print("Saved best hyperparameters (including channels) to best_cfg.json")
+            except Exception as e:
+                print(f"Warning: could not save best_cfg.json: {e}")
 
             self.fulltrain(best_cfg)
 
@@ -603,13 +903,21 @@ class Pipeline:
             "horizon": 320,
             "batch_size": 32,
             "learning_rate": 5e-5,
-            "weight_decay": 1e-4
+            "weight_decay": 1e-4,
+            "channels": None,
         }
 
-        debug_loader = BeatHarvest(trainCohort, SLIDING_WINDOW, debug_config["horizon"], debug_config["batch_size"]).push()
+        debug_loader = BeatHarvest(
+            trainCohort, 
+            SLIDING_WINDOW, 
+            debug_config["horizon"], 
+            debug_config["batch_size"], 
+            channels=debug_config.get("channels")
+            ).push()
 
+        input_dim_local = debug_loader.dataset.n_channels
         debug_model = VTATTEND(
-            input_dim=input_dim,
+            input_dim=input_dim_local,
             channel_sizes=debug_config["channel_sizes"],
             kernel_size=debug_config["kernel_size"],
             num_heads=debug_config["num_heads"],
@@ -633,7 +941,9 @@ def main():
     DEBUG = False
     pipeline = Pipeline()
     if not DEBUG:
+        pipeline.config["channels"] = channels
         pipeline.controlpanel()
+        pipeline.learning_curves(patient_counts=[5, 10, 20, 30], repeats=3, epochs=10)
     else:
         pipeline.debug()
 

@@ -8,28 +8,18 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 # //////////////////////////////////////////////////////////////////////////
 import torch
-from wandb import Api
 from sklearn.metrics import roc_curve, auc, confusion_matrix, f1_score, accuracy_score, precision_score
 # //////////////////////////////////////////////////////////////////////////
-from beatbot import VTATTEND, BeatHarvest, SLIDING_WINDOW, evaluationCohort, validationCohort, input_dim
+from beatbot import VTATTEND, BeatHarvest, SLIDING_WINDOW, evaluationCohort, validationCohort
 # ---------------------------------------------------------------------------------/
 cfg_path = "best_cfg.json"
 
-if os.path.exists(cfg_path):
-    with open(cfg_path, "r") as f:
-        best_cfg = json.load(f)
-
-else:
-    # Fetch best run from WandB and save config
-    api = Api()
-    entity = "jfuentesaguilar"
-    project = "VTATTEND_"
-    runs = api.runs(f"{entity}/{project}")
-    best_run = min(runs, key=lambda r: r.summary.get("val_loss", float("inf")))
-    best_cfg = best_run.config
-
-    with open(cfg_path, "w") as f:
-        json.dump(best_cfg, f, indent=2)
+if not os.path.exists(cfg_path):
+    raise FileNotFoundError(
+        "best_cfg.json not found. Run training (controlpanel) first to generate it."
+        )
+with open(cfg_path, "r") as f:
+    best_cfg = json.load(f)
 
 # ---------------------------------------------------------------------------------/
 class RingRing:
@@ -53,13 +43,16 @@ class RingRing:
         fpath = test_loader.dataset.files[0]
 
         with h5py.File(fpath, 'r', libver='latest', swmr=True) as f:
-            matrix = f['data'][:]
-
-        ecg = matrix[:, 1:13]
-        self.labels = matrix[:, 13]
-
-        # Time in seconds
-        self.time = matrix[:, 0]
+            ds = f['data']
+            # Slice only the needed columns
+            time_col = ds[:, 0]
+            ecg = ds[:, 1:13]
+            labels_col = ds[:, 13]
+        # Respect channel selection from the dataset (if any)
+        if hasattr(test_loader.dataset, 'channel_idx') and test_loader.dataset.channel_idx is not None:
+            ecg = ecg[:, test_loader.dataset.channel_idx]
+        self.labels = labels_col
+        self.time = time_col
 
         # Get sliding window parameters
         self.sliding_window = test_loader.dataset.sliding_window
@@ -331,17 +324,20 @@ class Monitor(RingRing):
 # ---------------------------------------------------------------------------------/
 def main():
 
-    # Data loaders for evaluation
+    # Data loader for evaluation (single patient file)
+    channels = best_cfg.get("channels", None)
     evaluation_loader = BeatHarvest(
-        [validationCohort[1]], 
-        SLIDING_WINDOW, 
-        best_cfg["horizon"], 
-        best_cfg["batch_size"]
-        ).push()
-    
+        [validationCohort[1]],
+        SLIDING_WINDOW,
+        best_cfg["horizon"],
+        best_cfg["batch_size"],
+        channels=channels
+    ).push()
+
     # Instantiate model with best hyperparameters
+    input_dim_local = getattr(evaluation_loader.dataset, 'n_channels', 12)
     model = VTATTEND(
-        input_dim=input_dim,
+        input_dim=input_dim_local,
         channel_sizes=best_cfg["channel_sizes"],
         kernel_size=best_cfg["kernel_size"],
         num_heads=best_cfg["num_heads"],
@@ -350,7 +346,13 @@ def main():
     )
 
     # Load trained model weights
-    model.load_state_dict(torch.load("best_VTATTEND.pth", map_location="cpu"))
+    weights_path = "best_VTATTEND.pth"
+
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError("best_VTATTEND.pth not found. Train and save the model first.")
+    
+    state = torch.load(weights_path, map_location="cpu")
+    model.load_state_dict(state)
 
     # Execute early warning evaluation
     monitor = Monitor(model, evaluation_loader)
