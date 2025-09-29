@@ -9,13 +9,12 @@ import multiprocessing
 # //////////////////////////////////////////////////////////////////////////
 import optuna
 from optuna.samplers import TPESampler
-from optuna.pruners import MedianPruner, SuccessiveHalvingPruner, HyperbandPruner
+from optuna.pruners import HyperbandPruner
 # //////////////////////////////////////////////////////////////////////////
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim import lr_scheduler
-from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, get_worker_info
 # //////////////////////////////////////////////////////////////////////////
 from sklearn.model_selection import GroupKFold
@@ -66,7 +65,8 @@ ft_epochs = 20      # Number of epochs for fine-tuning
 os.environ.setdefault("OPTUNA_TRIALS", "20")
 os.environ.setdefault("OPTUNA_FOLDS", "3")
 os.environ.setdefault("OPTUNA_EPOCHS", "12")
-# NOTE: I intentionally do NOT set a default for MAX_SAMPLES_PER_EPOCH; leaving it unset uses the full dataset per epoch.
+# NOTE: I intentionally do NOT set a default for MAX_SAMPLES_PER_EPOCH;
+# leaving it unset uses the full dataset per epoch.
 # -------------------------------------------------------------------------
 
 # ECG lead maps (consistent with dataCleaner.py: ecg_leads)
@@ -178,13 +178,13 @@ class BeatHarvest(Dataset):
                 vt_col = f['data'][:, 13]
 
             # Binarise and compute a rolling 'any VT in next horizon' vector
-            vt_bin = (vt_col == 1).astype(np.uint8)
+            vt_bin = (vt_col == 1).astype(np.int32)
             
             # Starts look at future window beginning at start + sliding_window
             # Build a view that covers all needed positions for convolution
             future = vt_bin[self.sliding_window : self.sliding_window + max_start + self.horizon]
             if self.horizon > 0:
-                kernel = np.ones(self.horizon, dtype=np.uint8)
+                kernel = np.ones(self.horizon, dtype=np.int32)
                 conv = np.convolve(future, kernel, mode='valid')  # length max_start + 1
                 labels_all = (conv > 0).astype(np.uint8)
             else:
@@ -232,6 +232,10 @@ class BeatHarvest(Dataset):
             ecg = ecg[:, self.channel_idx]
 
         x = torch.as_tensor(ecg, dtype=torch.float32)
+        # Demean per lead, scale by global window std to preserve cross‑lead ratios
+        x = x - x.mean(dim=0, keepdim=True)
+        scale = x.flatten().std() + 1e-6
+        x = x / scale
         y = torch.as_tensor([self.sample_labels[idx]], dtype=torch.float32)
         
         return x, y
@@ -256,45 +260,44 @@ class TemporalBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
         super().__init__()
 
-        # Use a padding to ensure the output size matches the input size
-        padding = (kernel_size - 1) * dilation
+        # Bottleneck structure: 1x1 -> kx1 (dilated) -> 1x1
+        mid_channels = max(out_channels // 4, 16)
+        pad = (kernel_size - 1) * dilation
 
-        # First convolution layer with weight normalisation
-        self.conv1 = weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding, dilation=dilation))
+        self.reduce = nn.Conv1d(in_channels, mid_channels, kernel_size=1)
+        self.bn1 = nn.BatchNorm1d(mid_channels)
         self.relu1 = nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(out_channels)
 
-        # Second convolution layer with weight normalisation
-        self.conv2 = weight_norm(nn.Conv1d(out_channels, out_channels, kernel_size, padding=padding, dilation=dilation))
+        self.conv = nn.Conv1d(mid_channels, mid_channels, kernel_size=kernel_size, padding=pad, dilation=dilation)
+        self.bn2 = nn.BatchNorm1d(mid_channels)
         self.relu2 = nn.ReLU()
         self.dropout2 = nn.Dropout(dropout)
-        self.norm2 = nn.LayerNorm(out_channels)
-        
-        # Downsample layer: only if in_channels != out_channels
-        self.downsample = (nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None)
+
+        self.expand = nn.Conv1d(mid_channels, out_channels, kernel_size=1)
+        self.bn3 = nn.BatchNorm1d(out_channels)
+
+        # Downsample layer only if needed to match residual channels
+        self.downsample = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
 
     def forward(self, x):
-        # Recall the input has shape (batch, channels, seq_len)
+        # x: (batch, channels, seq_len)
         seq_len = x.size(2)
 
-        # First conv + norm + activation + dropout
-        out = self.conv1(x)
-        out = out.transpose(1, 2)
-        out = self.norm1(out)
-        out = out.transpose(1, 2)
+        out = self.reduce(x)
+        out = self.bn1(out)
         out = self.relu1(out)
         out = self.dropout1(out)
 
-        # Second conv + norm + activation + dropout
-        out = self.conv2(out)
-        out = out.transpose(1, 2)
-        out = self.norm2(out)
-        out = out.transpose(1, 2)
+        out = self.conv(out)
+        out = self.bn2(out)
         out = self.relu2(out)
         out = self.dropout2(out)
 
-        # Crop to original length and residual
+        out = self.expand(out)
+        out = self.bn3(out)
+
+        # Crop to original length and add residual
         out = out[:, :, :seq_len]
         res = x if self.downsample is None else self.downsample(x)
         return out + res
@@ -303,43 +306,51 @@ class VTATTEND(nn.Module):
     def __init__(self, input_dim, channel_sizes, kernel_size, num_heads, dropout, horizon):
         super().__init__()
 
-        # Temporal convolutional encoder
+        # Temporal convolutional encoder (dilated TCN in bottleneck blocks)
         layers = []
         for i, out_ch in enumerate(channel_sizes):
             in_ch = input_dim if i == 0 else channel_sizes[i-1]
             dilation = 2 ** i
             layers.append(TemporalBlock(in_ch, out_ch, kernel_size, dilation, dropout))
-        
-        # Temporal Convolutional Network
         self.tcn = nn.Sequential(*layers)
 
-        # Self-attention decoder
-        self.attention = nn.MultiheadAttention(embed_dim=channel_sizes[-1], num_heads=num_heads, dropout=dropout, batch_first=True)
+        d_model = channel_sizes[-1]
 
-        # Prediction head
-        self.fc = nn.Linear(channel_sizes[-1], 1)
+        # Learnable absolute positional encoding (sliced to current length)
+        self._max_len = 4096
+        self.pos_embed = nn.Parameter(torch.zeros(1, self._max_len, d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # Self-attention block
+        self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, dropout=dropout, batch_first=True)
+
+        # Lightweight MLP head after pooling
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1)
+        )
 
     def forward(self, x, return_sequence: bool = False):
-        # Transpose for Conv1d: (batch, input_dim, seq_len)
-        x = x.transpose(1, 2)
+        # x: (batch, seq_len, channels)
+        x = x.transpose(1, 2)           # (B, C, L) for Conv1d
+        y = self.tcn(x)                  # (B, C', L)
+        y = y.transpose(1, 2)            # (B, L, C') for attention
 
-        # Temporal convolutional encoder
-        y = self.tcn(x)
-        
-        # Back to (batch, seq_len, channels)
-        y = y.transpose(1, 2)
-        
-        # Self-attention decoder
-        attn_out, _ = self.attention(y, y, y)
+        # Add positional information
+        L = y.size(1)
+        y = y + self.pos_embed[:, :L, :]
 
+        attn_in = y.to(torch.float32)
+        attn_out, _ = self.attention(attn_in, attn_in, attn_in)  # (B, L, C')
         if return_sequence:
             return attn_out
-        
-        # Use only the final time step for classification
-        z = attn_out[:, -1, :]
-        
-        # Prediction head
-        return self.fc(z)
+
+        # Mean-pool tokens and classify via a small MLP
+        z = attn_out.mean(dim=1)         # (B, C')
+        return self.head(z)
 
 class Cardiobot:
     def __init__(self, model, train_loader, val_loader=None, lr=1e-4, weight_decay=1e-5):
@@ -351,12 +362,31 @@ class Cardiobot:
         else:
             self.device = torch.device("cpu")
 
+        # Prefer TF32 on Ampere+ for extra headroom
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+
         self.model = model.to(self.device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         
         self.criterion = nn.BCEWithLogitsLoss()
-        self.optimiser = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        # AdamW with no weight decay on biases and norm parameters
+        decay, no_decay = [], []
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim == 1 or n.endswith('.bias') or 'norm' in n.lower() or 'bn' in n.lower():
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        self.optimiser = optim.AdamW([
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ], lr=lr)
         
         # Early stopping
         self.best_val_loss = float('inf')
@@ -366,8 +396,8 @@ class Cardiobot:
         # Number of channels used by the dataset
         self.n_channels = getattr(self.train_loader.dataset, 'n_channels', 12)
 
-        # AMP (mixed precision) setup
-        self.amp_enabled = torch.cuda.is_available()
+        # AMP (mixed precision) setup with env kill‑switch
+        self.amp_enabled = bool(int(os.getenv("AMP_ENABLED", "1"))) and torch.cuda.is_available()
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
 
         # Self-supervised components
@@ -445,7 +475,10 @@ class Cardiobot:
                 pred_list.extend(preds.cpu().tolist())
                 true_list.extend(labels.cpu().view(-1).tolist())
 
-                running_loss += loss.item()
+                li = float(loss.detach().item())
+                if not np.isfinite(li):
+                    li = 1e6
+                running_loss += li
                 num_batches += 1
 
         epoch_loss = running_loss / max(1, num_batches)
@@ -479,7 +512,10 @@ class Cardiobot:
                 pred_list.extend(preds.cpu().tolist())
                 true_list.extend(labels.cpu().view(-1).tolist())
 
-                running_loss += loss.item()
+                li = float(loss.detach().item())
+                if not np.isfinite(li):
+                    li = 1e6
+                running_loss += li
                 num_batches += 1
 
         epoch_loss = running_loss / max(1, num_batches)
@@ -586,7 +622,7 @@ class Pipeline:
             "channel_sizes": [[16, 32, 64], [32, 64, 128], [64, 128, 256]],
             "kernel_size": 3,
             "num_heads": 4,
-            "dropout": 0.6,
+            "dropout": 0.2,
             "horizon": 320,
             "batch_size": 32,
             "learning_rate": 5e-5,
@@ -611,9 +647,9 @@ class Pipeline:
         cs_ix = trial.suggest_categorical("channel_sizes_ix", list(range(len(channel_sizes_opts))))
 
         channel_sizes = list(channel_sizes_opts[cs_ix])
-        kernel_size = trial.suggest_categorical("kernel_size", [3, 5, 7])
+        kernel_size = trial.suggest_categorical("kernel_size", [3])
         num_heads = trial.suggest_categorical("num_heads", [2, 4, 8])
-        dropout = trial.suggest_float("dropout", 0.3, 0.7)
+        dropout = trial.suggest_float("dropout", 0.1, 0.3)
         learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
         batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
@@ -899,7 +935,7 @@ class Pipeline:
             "channel_sizes": [16, 32, 64],
             "kernel_size": 3,
             "num_heads": 4,
-            "dropout": 0.6,
+            "dropout": 0.2,
             "horizon": 320,
             "batch_size": 32,
             "learning_rate": 5e-5,
