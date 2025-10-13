@@ -232,9 +232,11 @@ class BeatHarvest(Dataset):
             ecg = ecg[:, self.channel_idx]
 
         x = torch.as_tensor(ecg, dtype=torch.float32)
-        # Demean per lead, scale by global window std to preserve cross‑lead ratios
+        # Demean per lead, then scale by a global window std with a safe floor to avoid huge gains
         x = x - x.mean(dim=0, keepdim=True)
-        scale = x.flatten().std() + 1e-6
+        scale = x.flatten().std()
+        if not torch.isfinite(scale) or float(scale) < 1e-3:
+            scale = torch.tensor(1e-3, dtype=x.dtype)
         x = x / scale
         y = torch.as_tensor([self.sample_labels[idx]], dtype=torch.float32)
         
@@ -262,7 +264,7 @@ class TemporalBlock(nn.Module):
 
         # Bottleneck structure: 1x1 -> kx1 (dilated) -> 1x1
         mid_channels = max(out_channels // 4, 16)
-        pad = (kernel_size - 1) * dilation
+        pad = ((kernel_size - 1) * dilation) // 2
 
         self.reduce = nn.Conv1d(in_channels, mid_channels, kernel_size=1)
         self.bn1 = nn.BatchNorm1d(mid_channels)
@@ -297,8 +299,7 @@ class TemporalBlock(nn.Module):
         out = self.expand(out)
         out = self.bn3(out)
 
-        # Crop to original length and add residual
-        out = out[:, :, :seq_len]
+        # Lengths match due to symmetric padding; add residual directly
         res = x if self.downsample is None else self.downsample(x)
         return out + res
 
@@ -336,6 +337,7 @@ class VTATTEND(nn.Module):
     def forward(self, x, return_sequence: bool = False):
         # x: (batch, seq_len, channels)
         x = x.transpose(1, 2)           # (B, C, L) for Conv1d
+        x = x.to(torch.float32)         # keep encoder in FP32 even under autocast
         y = self.tcn(x)                  # (B, C', L)
         y = y.transpose(1, 2)            # (B, L, C') for attention
 
@@ -399,6 +401,7 @@ class Cardiobot:
         # AMP (mixed precision) setup with env kill‑switch
         self.amp_enabled = bool(int(os.getenv("AMP_ENABLED", "1"))) and torch.cuda.is_available()
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
+        self.pre_scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
 
         # Self-supervised components
         self.mask_ratio = 0.3
@@ -428,7 +431,8 @@ class Cardiobot:
 
             with torch.amp.autocast("cuda", enabled=self.amp_enabled):
                 logits = self.model(ecg)
-                loss = self.criterion(logits, labels)
+            labels = labels.view_as(logits).to(logits.dtype)
+            loss = self.criterion(logits, labels)
 
             self.optimiser.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
@@ -467,13 +471,14 @@ class Cardiobot:
 
                 with torch.amp.autocast("cuda", enabled=self.amp_enabled):
                     logits = self.model(ecg)
-                    loss = self.criterion(logits, labels)
+                labels_loss = labels.view_as(logits).to(logits.dtype)
+                loss = self.criterion(logits, labels_loss)
 
                 # Convert logits to probabilities and threshold for binary prediction
-                probs = torch.sigmoid(logits).view(-1)
+                probs = torch.sigmoid(logits).squeeze(-1)
                 preds = (probs > 0.5).long()
                 pred_list.extend(preds.cpu().tolist())
-                true_list.extend(labels.cpu().view(-1).tolist())
+                true_list.extend(labels.squeeze(-1).cpu().tolist())
 
                 li = float(loss.detach().item())
                 if not np.isfinite(li):
@@ -505,12 +510,13 @@ class Cardiobot:
 
                 with torch.amp.autocast("cuda", enabled=self.amp_enabled):
                     logits = self.model(ecg)
-                    loss = self.criterion(logits, labels)
+                labels_loss = labels.view_as(logits).to(logits.dtype)
+                loss = self.criterion(logits, labels_loss)
 
-                probs = torch.sigmoid(logits).view(-1)
+                probs = torch.sigmoid(logits).squeeze(-1)
                 preds = (probs > 0.5).long()
                 pred_list.extend(preds.cpu().tolist())
-                true_list.extend(labels.cpu().view(-1).tolist())
+                true_list.extend(labels.squeeze(-1).cpu().tolist())
 
                 li = float(loss.detach().item())
                 if not np.isfinite(li):
@@ -555,11 +561,11 @@ class Cardiobot:
                 # Compute MSE on masked positions only
                 loss = self.pre_criterion(recon[mask_expanded], ecg[mask_expanded])
 
-            # Optimisation with AMP scaler
+            # Optimisation with dedicated AMP scaler
             self.pre_optimiser.zero_grad(set_to_none=True)
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.pre_optimiser)
-            self.scaler.update()
+            self.pre_scaler.scale(loss).backward()
+            self.pre_scaler.step(self.pre_optimiser)
+            self.pre_scaler.update()
 
             # Accumulate loss
             total_loss += loss.item()
