@@ -2,7 +2,9 @@ import os
 import glob
 import h5py
 import numpy as np
+# //////////////////////////////////////////////////////////////////////////
 import json
+import random
 # //////////////////////////////////////////////////////////////////////////
 import warnings
 import multiprocessing
@@ -102,13 +104,14 @@ channels = lead2channel(["ii (mV)", "v1 (mV)", "v5 (mV)"], one_based=True)
 
 # ---------------------------------------------------------------------------------/
 class BeatHarvest(Dataset):
-    def __init__(self, files, sliding_window=320, horizon=320, batch_size=16, overlap=0.25, num_workers=4, channels=None, samples_per_epoch=None):
+    def __init__(self, files, sliding_window=320, horizon=320, batch_size=16, overlap=0.25, num_workers=4, channels=None, samples_per_epoch=None, use_weighted_sampler=True):
         self.files = files
         self.sliding_window = sliding_window
         self.horizon = horizon
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.samples_per_epoch = samples_per_epoch
+        self.use_weighted_sampler = use_weighted_sampler
 
         # Optional channel selection (relative to columns 1..12 in the HDF5)
         self.channels = channels
@@ -203,6 +206,8 @@ class BeatHarvest(Dataset):
             raise ValueError("No valid windows were generated.")
 
     def wsampler(self):
+        if not self.use_weighted_sampler:
+            return None
         labels = np.array(self.sample_labels)
         count_pos = np.sum(labels == 1)
         count_neg = np.sum(labels == 0)
@@ -231,13 +236,18 @@ class BeatHarvest(Dataset):
         if self.channel_idx is not None:
             ecg = ecg[:, self.channel_idx]
 
-        x = torch.as_tensor(ecg, dtype=torch.float32)
+        # Sanitize non-finite values before normalisation
+        ecg = np.asarray(ecg)
+        ecg = np.nan_to_num(ecg, nan=0.0, posinf=0.0, neginf=0.0)
+
+        x = torch.from_numpy(ecg).to(torch.float32)
         # Demean per lead, then scale by a global window std with a safe floor to avoid huge gains
         x = x - x.mean(dim=0, keepdim=True)
         scale = x.flatten().std()
         if not torch.isfinite(scale) or float(scale) < 1e-3:
             scale = torch.tensor(1e-3, dtype=x.dtype)
         x = x / scale
+        x = torch.nan_to_num(x)
         y = torch.as_tensor([self.sample_labels[idx]], dtype=torch.float32)
         
         return x, y
@@ -257,7 +267,25 @@ class BeatHarvest(Dataset):
         worker_info = get_worker_info()
         dataset = worker_info.dataset
         dataset._h5_files = {}
+        seed = torch.initial_seed() % (2**32)
+        np.random.seed(int(seed + worker_id))
+        random.seed(int(seed + worker_id))
     
+# --------------------------------------------------------------------------
+def seeding(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+# Lightweight textual progress bar for console output
+def progress_bar(i: int, total: int, width: int = 28) -> str:
+    i = max(0, min(int(i), int(total)))
+    total = max(1, int(total))
+    filled = int(width * (i / total))
+    return f"[{'#' * filled}{'-' * (width - filled)}] {i}/{total} ({(i / total) * 100:5.1f}%)"
+
 class TemporalBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
         super().__init__()
@@ -450,7 +478,7 @@ class Cardiobot:
         self.scheduler.step()
 
         # ////////////////////////////////////////////////////////////////////////////////////
-        print(f"Epoch {epoch_index + 1}/{self.num_epochs} Training Loss: {epoch_loss:.6f}")
+        print(f"[SUP]  {progress_bar(epoch_index+1, self.num_epochs)}  Epoch {epoch_index+1}/{self.num_epochs}  Training loss: {epoch_loss:.6f}", flush=True)
         # ////////////////////////////////////////////////////////////////////////////////////
         return epoch_loss
     
@@ -489,7 +517,7 @@ class Cardiobot:
         epoch_loss = running_loss / max(1, num_batches)
 
         # ////////////////////////////////////////////////////////////////////////////////////
-        print(f"Epoch {epoch_index + 1}/{self.num_epochs} Validation Loss: {epoch_loss:.6f}")
+        print(f"[VAL]  {progress_bar(epoch_index+1, self.num_epochs)}  Epoch {epoch_index+1}/{self.num_epochs}  Validation loss: {epoch_loss:.6f}", flush=True)
         # ////////////////////////////////////////////////////////////////////////////////////
 
         # Compute precision, recall, f1
@@ -574,7 +602,7 @@ class Cardiobot:
         avg_loss = total_loss / max(1, len(self.train_loader))
 
         # ////////////////////////////////////////////////////////////////////////////////////
-        print(f"Pretrain Epoch {epoch_index+1}, Loss: {avg_loss:.6f}")
+        print(f"[SSL]  {progress_bar(epoch_index+1, self.pre_epochs)}  Epoch {epoch_index+1}/{self.pre_epochs}  Loss: {avg_loss:.6f}", flush=True)
         # ////////////////////////////////////////////////////////////////////////////////////
 
         return avg_loss
@@ -582,6 +610,10 @@ class Cardiobot:
     def fit(self, num_epochs, pre_epochs, patience, ssl=False, trial=None, report_base_step=0, prune=True):
         self.num_epochs = num_epochs
         self.pre_epochs = pre_epochs
+
+        print("\n" + "=" * 80, flush=True)
+        print(f"Beginning training  |  SSL pretraining: {'yes' if (ssl and self.pre_epochs > 0) else 'no'}  |  Supervised epochs: {self.num_epochs}  |  Patience: {patience}", flush=True)
+        print("=" * 80 + "\n", flush=True)
 
         # Scheduler for supervised phase
         if num_epochs > 0:
@@ -620,6 +652,8 @@ class Cardiobot:
                 # //////////////////////////////////////////////////////////////
                 break
 
+        print(f"Completed supervised training. Best validation loss: {best_val_loss:.6f}\n", flush=True)
+
 # ----------------------------------------------------------------------------------/
 class Pipeline:
     def __init__(self):
@@ -641,9 +675,14 @@ class Pipeline:
         folds = int(os.getenv("OPTUNA_FOLDS", "3"))
         epochs = int(os.getenv("OPTUNA_EPOCHS", "12"))
 
+        _trial_no = int(getattr(trial, 'number', 0)) + 1
+        _total_trials = int(os.getenv("OPTUNA_TRIALS", "20"))
+        print("\n" + "\u2500" * 80, flush=True)
+        print(f"Optuna trial {_trial_no}/{_total_trials}", flush=True)
+        print("/" * 90, flush=True)
+
         # REMINDER: export MAX_SAMPLES_PER_EPOCH=50000 to cap per-epoch work
-        samples_cap = int(os.getenv("MAX_SAMPLES_PER_EPOCH", "0"))
-        
+        samples_cap = int(os.getenv("MAX_SAMPLES_PER_EPOCH", "100000"))
         if samples_cap <= 0:
             samples_cap = None
 
@@ -670,7 +709,10 @@ class Pipeline:
         validation_losses = []
 
         for fold, (train_idx, val_idx) in enumerate(kf.split(files, groups=groups)):
+
             print(f"Starting cross-validation fold {fold + 1}/{kf.n_splits}")
+            print(f"\n-> Fold {fold + 1}/{kf.n_splits}  epochs={epochs}  batch_size={batch_size}  horizon={horizon}", flush=True)
+            
             train_files = [files[i] for i in train_idx]
             validation_files = [files[i] for i in val_idx]
 
@@ -689,7 +731,8 @@ class Pipeline:
                 horizon,
                 batch_size,
                 channels=self.config.get("channels"),
-                samples_per_epoch=samples_cap
+                samples_per_epoch=samples_cap,
+                use_weighted_sampler=False
             ).push()
 
             input_dim_local = train_loader.dataset.n_channels
@@ -714,11 +757,20 @@ class Pipeline:
 
             m = trainer.evaluate(validation_loader)
             validation_losses.append(m["val_loss"])
+            print(f"Fold {fold + 1}  validation loss: {m['val_loss']:.6f}", flush=True)
 
         avg_val_loss = sum(validation_losses) / len(validation_losses)
+        print(f"Trial {_trial_no}  mean validation loss: {avg_val_loss:.6f}\n", flush=True)
         return avg_val_loss
 
     def fulltrain(self, best_cfg):
+        print("\n" + "=" * 90, flush=True)
+        print("Final training with best hyperparameters:", flush=True)
+        try:
+            print(json.dumps(best_cfg, indent=2), flush=True)
+        except Exception:
+            pass
+        print("=" * 90 + "\n", flush=True)
         samples_cap = int(os.getenv("MAX_SAMPLES_PER_EPOCH", "0"))
         if samples_cap <= 0:
             samples_cap = None
@@ -728,7 +780,8 @@ class Pipeline:
             best_cfg["horizon"], 
             best_cfg["batch_size"], 
             channels=self.config.get("channels"),
-            samples_per_epoch=samples_cap
+            samples_per_epoch=samples_cap,
+            use_weighted_sampler=True
             ).push()
         
         validation_loader = BeatHarvest(
@@ -737,7 +790,8 @@ class Pipeline:
             best_cfg["horizon"], 
             best_cfg["batch_size"], 
             channels=self.config.get("channels"),
-            samples_per_epoch=samples_cap
+            samples_per_epoch=samples_cap,
+            use_weighted_sampler=False
             ).push()
 
         input_dim_local = train_loader.dataset.n_channels
@@ -804,7 +858,8 @@ class Pipeline:
                 val_loader = BeatHarvest(
                     validationCohort, SLIDING_WINDOW, cfg.get("horizon", 320), cfg.get("batch_size", 32),
                     channels=self.config.get("channels"),
-                    samples_per_epoch=samples_cap
+                    samples_per_epoch=samples_cap,
+                    use_weighted_sampler=False
                 ).push()
 
                 # Model and trainer
@@ -895,9 +950,12 @@ class Pipeline:
             # Define number of trials from environment variable or default
             n_trials = int(os.getenv("OPTUNA_TRIALS", "20"))
 
+            print("\n" + "#" * 90, flush=True)
+            print(f"Starting Optuna optimisation  |  trials={n_trials}  |  folds={int(os.getenv('OPTUNA_FOLDS','3'))}  |  epochs per trial={int(os.getenv('OPTUNA_EPOCHS','12'))}", flush=True)
+            print("#" * 80, flush=True)
+
             # Use TPE sampler and multi-fidelity pruner
             sampler = TPESampler(seed=42)
-            
             pruner = HyperbandPruner(min_resource=3, reduction_factor=3)
             
             # Create study
@@ -908,6 +966,7 @@ class Pipeline:
 
             print("Best hyperparameters found:")
             print(study.best_trial.params)
+            print("-" * 80, flush=True)
 
             # Reconstruct channel_sizes from stored index
             _channel_sizes_opts = ((16, 32, 64), (32, 64, 128), (64, 128, 256))
@@ -981,11 +1040,13 @@ class Pipeline:
 # ---------------------------------------------------------------------------------/
 def main():
     DEBUG = False
+    seeding(42)
     pipeline = Pipeline()
     if not DEBUG:
         pipeline.config["channels"] = channels
         pipeline.controlpanel()
-        pipeline.learning_curves(patient_counts=[5, 10, 20, 30], repeats=3, epochs=10)
+        if os.getenv("RUN_LEARNING_CURVES", "0") == "1":
+            pipeline.learning_curves(patient_counts=[5, 10, 20, 30], repeats=3, epochs=10)
     else:
         pipeline.debug()
 
