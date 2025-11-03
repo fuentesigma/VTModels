@@ -2,20 +2,28 @@
 
 This repository implements a pipeline for training a deep learning model, **VTATTEND**, designed for early prediction of ventricular tachycardia (VT) using multi-lead ECG time series data. The project includes data preprocessing, outlier handling, self-supervised pretraining, model training, and final evaluation.
 
+# Running `run_experiments.py` (NEW)
+
+This document explains how to execute `run_experiments.py` and what other parts of the codebase are required. It is intended for internal use in this private repository.
+
+## Purpose of `run_experiments.py`
+
+The script `run_experiments.py` is a thin launcher around the training engine implemented in `beatbotLite.py`. It builds a cohort of patients from the HDF5 data files, defines a training and evaluation split, sets a few key hyperparameters, and then calls `run_training` from `beatbotLite`.
+
+In other words, you do not normally call `beatbotLite.py` directly for day to day experiments. Instead, you run `run_experiments.py`, which prepares the arguments and invokes the training pipeline for you.
+
+## Code pieces you need
+
+In order to run `run_experiments.py` successfully, you need at least the following pieces in place.
+
+First, you need `run_experiments.py` itself, located in the repository root (or in whatever directory the project is organised around). The script imports two names from `beatbotLite`:
+
+```python
+from beatbotLite import run_training, build_parser
+
 ---
 
-## Pipeline Overview
-
-The training workflow consists of the following steps:
-
-1. **Preprocess the raw ECG data**
-2. **(Optionally) remove patient outliers**
-3. **Train the VTATTEND model**
-4. **(Optionally) run the post-training early warning system**
-
----
-
-## File Summary
+## File Summary (outdated)
 
 ### `dataCleaner.py`: ECG Preprocessing and Segmentation
 
