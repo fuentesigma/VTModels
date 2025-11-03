@@ -20,6 +20,9 @@ First, you need `run_experiments.py` itself, located in the repository root (or 
 
 ```python
 from beatbotLite import run_training, build_parser
+```
+
+and then uses `build_parser()` to construct the argument parser that defines all command-flags options.
 
 ---
 
