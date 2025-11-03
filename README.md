@@ -10,20 +10,6 @@ This document explains how to execute `run_experiments.py` and what other parts 
 
 The script `run_experiments.py` is a thin launcher around the training engine implemented in `beatbotLite.py`. It builds a cohort of patients from the HDF5 data files, defines a training and evaluation split, sets a few key hyperparameters, and then calls `run_training` from `beatbotLite`.
 
-In other words, you do not normally call `beatbotLite.py` directly for day to day experiments. Instead, you run `run_experiments.py`, which prepares the arguments and invokes the training pipeline for you.
-
-## Code pieces you need
-
-In order to run `run_experiments.py` successfully, you need at least the following pieces in place.
-
-First, you need `run_experiments.py` itself, located in the repository root (or in whatever directory the project is organised around). The script imports two names from `beatbotLite`:
-
-```python
-from beatbotLite import run_training, build_parser
-```
-
-and then uses `build_parser()` to construct the argument parser that defines all command-flags options.
-
 ---
 
 ## File Summary (outdated)
