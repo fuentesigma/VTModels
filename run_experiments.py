@@ -25,10 +25,6 @@ def main():
 
     args.train_patients = train_patients
     args.eval_patients = eval_patients
-    args.lr = 3e-4
-    args.horizon = 1920
-    args.smooth_window = 0.5
-    args.smooth_half_life = 0.5
 
     run_training(args)
 

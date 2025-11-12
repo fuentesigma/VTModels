@@ -1,8 +1,4 @@
-import argparse
-import glob
-import math
-import os
-import random
+import argparse, copy, glob, os, random, math
 from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -11,6 +7,7 @@ import h5py
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
@@ -19,9 +16,24 @@ from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 ECG_LEADS = ["i (mV)", "ii (mV)", "iii (mV)", "avr (mV)", "avl (mV)", "avf (mV)", "v1 (mV)", "v2 (mV)", "v3 (mV)", "v4 (mV)", "v5 (mV)", "v6 (mV)"]
 LEAD_TO_INDEX = {name: idx for idx, name in enumerate(ECG_LEADS)}
 DEFAULT_LEADS = ["ii (mV)", "v1 (mV)", "v5 (mV)"]
-DEFAULT_OUTPUT_DIR = "artifacts"
-DEFAULT_SEED = 42
-DEFAULT_DATA_ROOT = "VT-data"
+SEED = 42
+OUTPUTDIR = "output"
+DATAFOLDER = "VT-data"
+
+# NEW: core timing defaults
+SAMPLERATE = 32.0
+HORIZON_SECONDS = 2 * 60.0
+HORIZON_SAMPLES = int(HORIZON_SECONDS * SAMPLERATE)
+
+# NEW: label and early-warning hyperparameters (easy to tweak)
+# 1 - (d/horizon)^power
+LABEL_RAMP_POWER = 2.0
+# Strength of penalty for early high risk
+EARLY_PENALTY_LAMBDA = 0.3
+# Start penalising > 20 min before VT
+EARLY_PENALTY_MIN = 20.0 * 60.0
+# Target max probability far from VT
+EARLY_PENALTY_MAX_PROB = 0.05
 
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
@@ -48,7 +60,7 @@ def extract_patient_id(file_path: str) -> Optional[int]:
     except (IndexError, ValueError):
         return None
 
-def available_patient_files(root: str = DEFAULT_DATA_ROOT) -> List[str]:
+def available_patient_files(root: str = DATAFOLDER) -> List[str]:
     pattern = os.path.join(root, "Patient_*.h5")
     return sorted(glob.glob(pattern))
 
@@ -108,35 +120,76 @@ class SinglePatientDataset(Dataset):
         if max_start <= 0:
             raise ValueError("Not enough samples for the chosen window/horizon.")
 
+        # NEW: time-aware labels based on distance to next VT onset
         vt_bin = (self.vt == 1).astype(np.int32)
-        future = vt_bin[self.sliding_window : self.sliding_window + max_start + self.horizon]
-        if self.horizon > 0:
-            kernel = np.ones(self.horizon, dtype=np.int32)
-            conv = np.convolve(future, kernel, mode="valid")
-            labels_all = (conv > 0).astype(np.uint8)
-        else:
-            labels_all = np.zeros(max_start + 1, dtype=np.uint8)
+        N = vt_bin.shape[0]
+
+        # NEW: precompute index of next VT sample at or after each position
+        next_vt = np.full(N, -1, dtype=int)  # NEW
+        last = -1  # NEW
+        for i in range(N - 1, -1, -1):  # NEW
+            if vt_bin[i] == 1:  # NEW
+                last = i  # NEW
+            next_vt[i] = last  # NEW
+
+        labels_all = np.zeros(max_start + 1, dtype=np.float32)  # NEW
+        time_to_vt_all = np.full(max_start + 1, np.inf, dtype=np.float32)  # NEW
+
+        if self.horizon > 0:  # NEW
+            horizon_f = float(self.horizon)  # NEW
+            for start in range(max_start + 1):  # NEW
+                # Consider the end of the current window as reference  # NEW
+                idx = start + self.sliding_window  # NEW
+                if idx >= N:  # NEW
+                    continue  # NEW
+                j = next_vt[idx]  # NEW
+                if j < 0:  # no future VT  # NEW
+                    continue  # NEW
+                distance_samples = float(j - idx)  # NEW
+                if distance_samples < 0:  # NEW
+                    continue  # NEW
+                distance_sec = distance_samples / self.sample_rate  # NEW
+                time_to_vt_all[start] = distance_sec  # NEW
+                if distance_samples <= self.horizon:  # within horizon  # NEW
+                    # Linearly ramp label from 0 at horizon to 1 at onset  # NEW
+                    labels_all[start] = 1.0 - distance_samples / horizon_f  # NEW
+        else:  # NEW
+            labels_all = np.zeros(max_start + 1, dtype=np.float32)  # NEW
+            time_to_vt_all = np.full(max_start + 1, np.inf, dtype=np.float32)  # NEW
 
         starts = np.arange(0, max_start + 1, self.step_size, dtype=int)
-        pos_idx = np.where(labels_all == 1)[0]
-        if pos_idx.size > 0:
-            pad = max(self.horizon, self.step_size)
-            fine = max(1, self.step_size // 4)
-            extra = []
-            for pos in pos_idx:
-                left = max(0, pos - pad)
-                right = int(pos)
-                extra.extend(range(left, right + 1, fine))
-            if extra:
-                starts = np.unique(np.clip(np.concatenate([starts, np.asarray(extra, dtype=int)]), 0, max_start))
+        # NEW: treat any window with label > 0 as "positive", but weight by label strength
+        pos_idx = np.where(labels_all > 0.0)[0]  # NEW
+        if pos_idx.size > 0:  # NEW
+            pad_base = max(self.horizon, self.step_size)  # NEW
+            fine = max(1, self.step_size // 4)  # NEW
+            extra = []  # NEW
+            for pos in pos_idx:  # NEW
+                strength = float(labels_all[pos])  # between 0 and 1  # NEW
+                if strength <= 0.0:  # NEW
+                    continue  # NEW
+                # NEW: focus oversampling more strongly near high-label (near-onset) windows
+                pad = max(self.step_size, int(pad_base * strength))  # NEW
+                left = max(0, pos - pad)  # NEW
+                right = int(pos)  # NEW
+                extra.extend(range(left, right + 1, fine))  # NEW
+            if extra:  # NEW
+                starts = np.unique(  # NEW
+                    np.clip(np.concatenate([starts, np.asarray(extra, dtype=int)]), 0, max_start)  # NEW
+                )  # NEW
 
         self.starts = starts.astype(int)
-        self.labels = labels_all[self.starts].astype(np.uint8)
+        self.labels = labels_all[self.starts].astype(np.float32)  # NEW
+        self.time_to_vt = time_to_vt_all[self.starts].astype(np.float32)  # NEW
+
+        # NEW: treat labels > 0 as positive for summary
+        pos_windows = int((self.labels > 0.0).sum())  # NEW
+        neg_windows = int((self.labels <= 0.0).sum())  # NEW
 
         self.summary = DatasetSummary(
             total_windows=int(self.labels.size),
-            positive_windows=int((self.labels == 1).sum()),
-            negative_windows=int((self.labels == 0).sum()),
+            positive_windows=pos_windows,  # NEW
+            negative_windows=neg_windows,  # NEW
             sample_rate=self.sample_rate,
             window_seconds=float(self.sliding_window) / self.sample_rate,
             horizon_seconds=float(self.horizon) / self.sample_rate,
@@ -150,7 +203,7 @@ class SinglePatientDataset(Dataset):
     def __len__(self) -> int:
         return int(self.starts.size)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         start = int(self.starts[idx])
         segment = self.ecg[start : start + self.sliding_window]
         segment = np.nan_to_num(segment, nan=0.0, posinf=0.0, neginf=0.0)
@@ -161,7 +214,9 @@ class SinglePatientDataset(Dataset):
         segment = segment / std
         x = torch.from_numpy(segment.astype(np.float32))
         y = torch.tensor([float(self.labels[idx])], dtype=torch.float32)
-        return x, y
+        # NEW: time-to-VT (seconds) for this window; inf if no future VT
+        dist_sec = torch.tensor([float(self.time_to_vt[idx])], dtype=torch.float32)  # NEW
+        return x, y, dist_sec  # NEW
 
 class VTNETlite(nn.Module):
     def __init__(self, n_channels: int) -> None:
@@ -229,13 +284,13 @@ class PatientWindowCollection(Dataset):
         self.cum_lengths = np.cumsum(self.lengths, dtype=int)
         self.labels = (
             np.concatenate([ds.labels for ds in self.patient_datasets])
-            if self.lengths else np.array([], dtype=np.uint8)
+            if self.lengths else np.array([], dtype=np.float32)
         )
 
     def __len__(self) -> int:
         return int(self.cum_lengths[-1]) if self.lengths else 0
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int):
         if idx < 0:
             idx += len(self)
         if idx < 0 or idx >= len(self):
@@ -257,13 +312,18 @@ class PatientWindowCollection(Dataset):
         shuffle = False
         labels = self.labels
         if weighted and labels.size > 0:
-            pos = int((labels == 1).sum())
-            neg = int((labels == 0).sum())
-            if pos > 0 and neg > 0:
-                weights = np.where(labels == 1, 1.0 / max(pos, 1), 1.0 / max(neg, 1))
-                sampler = WeightedRandomSampler(weights=weights.tolist(), num_samples=len(labels), replacement=True)
-            else:
-                shuffle = True
+            # NEW: treat labels >= 0.5 as "positive" for sampling
+            pos_mask = labels >= 0.5  # NEW
+            neg_mask = labels < 0.5  # NEW
+            pos = int(pos_mask.sum())  # NEW
+            neg = int(neg_mask.sum())  # NEW
+            if pos > 0 and neg > 0:  # NEW
+                weights = np.where(pos_mask, 1.0 / max(pos, 1), 1.0 / max(neg, 1))  # NEW
+                sampler = WeightedRandomSampler(  # NEW
+                    weights=weights.tolist(), num_samples=len(labels), replacement=True  # NEW
+                )  # NEW
+            else:  # NEW
+                shuffle = True  # NEW
         elif not weighted:
             shuffle = False
         else:
@@ -276,12 +336,40 @@ def train_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer, devi
     total_loss = 0.0
     batches = 0
 
-    for x, y in loader:
+    # # NEW: hyperparameters for early high-probability penalty
+    # EARLY_PENALTY_LAMBDA = 0.1
+    # # Penalise very early high risk
+    # EARLY_PENALTY_MIN = 20.0 * 60.0
+    # # Encourage low prob far from VT
+    # EARLY_PENALTY_MAX_PROB = 0.1
+
+    for batch in loader:
+        if len(batch) == 3:  # NEW
+            x, y, dist = batch  # NEW
+        else:  # NEW
+            x, y = batch  # NEW
+            dist = None  # NEW
+
         x = x.to(device)
         y = y.to(device)
+        dist = dist.to(device) if dist is not None else None  # NEW
+
         optimizer.zero_grad(set_to_none=True)
         logits = model(x)
-        loss = criterion(logits, y)
+        base_loss = criterion(logits, y)
+        loss = base_loss  # NEW
+
+        # NEW: add penalty for very early windows with high probability
+        if dist is not None and EARLY_PENALTY_LAMBDA > 0.0:  # NEW
+            probs = torch.sigmoid(logits)  # NEW
+            # Windows far from VT (or with no VT: dist ~ inf)  # NEW
+            early_mask = dist.view_as(probs) > EARLY_PENALTY_MIN  # NEW
+            if early_mask.any():  # NEW
+                early_probs = probs[early_mask]  # NEW
+                if early_probs.numel() > 0:  # NEW
+                    penalty = ((early_probs - EARLY_PENALTY_MAX_PROB).clamp(min=0.0) ** 2).mean()  # NEW
+                    loss = loss + EARLY_PENALTY_LAMBDA * penalty  # NEW
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -295,7 +383,11 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion, device: torch.devi
     probs = []
     labels = []
     with torch.no_grad():
-        for x, y in loader:
+        for batch in loader:
+            if len(batch) == 3:  # NEW
+                x, y, _ = batch  # NEW
+            else:  # NEW
+                x, y = batch  # NEW
             x = x.to(device)
             y = y.to(device)
             logits = model(x)
@@ -315,16 +407,19 @@ def summary(probs: np.ndarray, labels: np.ndarray) -> dict:
     if probs.size == 0:
         return {"threshold": 0.5, "precision": 0.0, "recall": 0.0, "f1": 0.0, "roc_auc": float("nan")}
     
+    # NEW: treat labels >= 0.5 as positive when computing metrics
+    bin_labels = (labels >= 0.5).astype(int)  # NEW
+
     grid = np.linspace(0.1, 0.9, 17)
     best = {"threshold": 0.5, "f1": -1.0, "precision": 0.0, "recall": 0.0}
 
     for thr in grid:
         preds = (probs >= thr).astype(int)
-        precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average="binary", zero_division=0)
+        precision, recall, f1, _ = precision_recall_fscore_support(bin_labels, preds, average="binary", zero_division=0)  # NEW
         if f1 > best["f1"]:
             best.update({"threshold": float(thr), "precision": float(precision), "recall": float(recall), "f1": float(f1)})
     try:
-        roc_auc = float(roc_auc_score(labels, probs)) if len(np.unique(labels)) > 1 else float("nan")
+        roc_auc = float(roc_auc_score(bin_labels, probs)) if len(np.unique(bin_labels)) > 1 else float("nan")  # NEW
     except Exception:
         roc_auc = float("nan")
 
@@ -360,7 +455,10 @@ def plot_ew(
     threshold: float,
     output_path: str,
     smooth_window: int = 0,
-    smooth_half_life: float = 0.0
+    smooth_half_life: float = 0.0,
+    pre_smoothed: Optional[np.ndarray] = None,
+    display_alarm_time: Optional[float] = None,
+    max_lead_time: Optional[float] = None,
 ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     
     if probs.size == 0:
@@ -372,27 +470,51 @@ def plot_ew(
     vt_indices = np.where(dataset.vt == 1)[0]
     onset_time = float(vt_indices[0] / dataset.sample_rate) if vt_indices.size > 0 else None
 
-    smooth = smooth_probs(probs, time_seconds, smooth_window, smooth_half_life)
-    smoothing_active = smooth_window > 1 or smooth_half_life > 0.0
+    if pre_smoothed is not None:
+        smooth = np.asarray(pre_smoothed, dtype=float)
+        if smooth.shape != probs.shape:
+            raise ValueError("pre_smoothed probabilities must match probs shape")
+    else:
+        smooth = smooth_probs(probs, time_seconds, smooth_window, smooth_half_life)
+    smoothing_active = pre_smoothed is not None or smooth_window > 1 or smooth_half_life > 0.0
     crosses = np.where(smooth >= float(threshold))[0]
     first_cross = float(time_seconds[crosses[0]]) if crosses.size > 0 else None
     lead_time = None
+
     if onset_time is not None and first_cross is not None:
         lead_time = float(max(0.0, onset_time - first_cross))
 
     fig, ax = plt.subplots(figsize=(10, 4), tight_layout=True)
     ax.step(time_minutes, horizon_labels, where="post", color="#e83875", alpha=0.6, linewidth=2.0, label="Future VT label")
-    if smoothing_active:
-        ax.plot(time_minutes, probs, color="#95a5a6", linewidth=1.2, alpha=0.6, label="Raw probability")
-    prob_label = "Smoothed probability" if smoothing_active else "Predicted probability"
-    ax.plot(time_minutes, smooth, color="#2980b9", linewidth=2.0, label=prob_label)
+
+    #if smoothing_active:
+    #    ax.plot(time_minutes, probs, color="#a2adad", linewidth=1.2, alpha=0.6, label="Probability (raw)")
+
+    prob_label = "Probability" if smoothing_active else "Predicted probability"
+    ax.plot(time_minutes, smooth, color="#4aa5e2", linewidth=2.0, label=prob_label)
     ax.axhline(threshold, color="#555555", linestyle="--", linewidth=1.5, label=f"Threshold {threshold:.2f}")
 
     if onset_time is not None:
         ax.axvline(onset_time / 60.0, color="#d36aa2", linestyle="--", linewidth=2.0, label=f"VT onset ({onset_time/60:.1f} min)")
-    if first_cross is not None:
-        ax.axvline(first_cross / 60.0, color="#2c955d", linestyle="-", linewidth=2.0, label=f"Alarm ({first_cross/60:.1f} min)")
-        ax.scatter([first_cross / 60.0], [threshold], color="#2c955d", s=60, zorder=5)
+
+    if max_lead_time is not None and max_lead_time > 0.0 and onset_time is not None:
+        window_start = max(0.0, onset_time - max_lead_time)
+        ax.axvspan(
+            window_start / 60.0,
+            onset_time / 60.0,
+            color="#C8F05B",
+            alpha=0.25,
+            label=f"Window (<={max_lead_time/60:.1f} min)",
+        )
+    alarm_time = display_alarm_time if display_alarm_time is not None else first_cross
+
+    if alarm_time is not None:
+        label = "Alarm"
+        if display_alarm_time is not None and (first_cross is None or not math.isclose(alarm_time, first_cross, rel_tol=1e-6, abs_tol=1e-3)):
+            label = "Accepted alarm"
+        label = f"{label} ({alarm_time/60:.1f} min)"
+        ax.axvline(alarm_time / 60.0, color="#C089D9", linestyle="-", linewidth=2.0, label=label)
+        ax.scatter([alarm_time / 60.0], [threshold], color="#C089D9", s=60, zorder=5)
 
     def timeform(x, _):
         total_seconds = float(x) * 60.0
@@ -414,7 +536,7 @@ def plot_ew(
     return first_cross, lead_time, onset_time
 
 def run_training(args: argparse.Namespace) -> None:
-    set_seed(DEFAULT_SEED)
+    set_seed(SEED)
 
     lead_names = list(DEFAULT_LEADS)
     channels = parse_leads(lead_names)
@@ -477,7 +599,7 @@ def run_training(args: argparse.Namespace) -> None:
     )
 
     train_dataset = PatientWindowCollection(train_files, drop_trivial=True, **dataset_kwargs)
-    eval_dataset = PatientWindowCollection(eval_files, drop_trivial=False, **dataset_kwargs)
+    eval_dataset = PatientWindowCollection(eval_files, drop_trivial=True, **dataset_kwargs)
 
     if train_dataset.trivial_summaries:
         skipped = [s.patient_id for s in train_dataset.trivial_summaries]
@@ -496,7 +618,7 @@ def run_training(args: argparse.Namespace) -> None:
             print(f"  {path}: {err}")
     if eval_dataset.trivial_summaries:
         info = [s.patient_id for s in eval_dataset.trivial_summaries]
-        print(f"Evaluation set contains {len(info)} trivial patients (kept for reference): {info}")
+        print(f"Evaluation set contains {len(info)} trivial patients (excluded from evaluation metrics): {info}")
 
     train_loader = train_dataset.make_loader(args.batch_size, weighted=True)
     eval_loader = eval_dataset.make_loader(args.batch_size, weighted=False) if not eval_dataset.is_empty else None
@@ -504,14 +626,14 @@ def run_training(args: argparse.Namespace) -> None:
     device = pick_device()
     model = VTNETlite(n_channels=len(channels)).to(device)
 
-    pos_weight = None
     train_labels = train_dataset.labels
     if train_labels.size > 0:
-        positives = int((train_labels == 1).sum())
-        negatives = int((train_labels == 0).sum())
-        if positives > 0:
-            pos_weight = torch.tensor([float(max(negatives, 1) / max(positives, 1))], device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight) if pos_weight is not None else nn.BCEWithLogitsLoss()
+        # NEW: interpret labels >= 0.5 as positive for reporting
+        positives = int((train_labels >= 0.5).sum())  # NEW
+        negatives = int((train_labels < 0.5).sum())  # NEW
+        print(f"Training windows: total={len(train_labels)} positives={positives} negatives={negatives}")
+
+    criterion = nn.BCEWithLogitsLoss()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -525,7 +647,7 @@ def run_training(args: argparse.Namespace) -> None:
             metrics = summary(val_probs, val_labels)
             if val_loss < best_val:
                 best_val = val_loss
-                best_state = model.state_dict()
+                best_state = copy.deepcopy(model.state_dict())
             print(
                 f"Epoch {epoch:03d} | train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
                 f"val_f1={metrics['f1']:.3f} thr={metrics['threshold']:.2f}"
@@ -536,13 +658,14 @@ def run_training(args: argparse.Namespace) -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    output_dir = DEFAULT_OUTPUT_DIR
+    output_dir = OUTPUTDIR
     os.makedirs(output_dir, exist_ok=True)
 
     aggregate_metrics = None
     aggregate_probs = np.array([], dtype=float)
     aggregate_labels = np.array([], dtype=float)
     aggregate_loss = float("nan")
+    
     if eval_loader is not None:
         aggregate_loss, aggregate_probs, aggregate_labels = evaluate(model, eval_loader, criterion, device)
         aggregate_metrics = summary(aggregate_probs, aggregate_labels)
@@ -552,6 +675,14 @@ def run_training(args: argparse.Namespace) -> None:
             f"precision={aggregate_metrics['precision']:.3f}  recall={aggregate_metrics['recall']:.3f}  "
             f"threshold={aggregate_metrics['threshold']:.2f}  ROC-AUC={aggregate_metrics['roc_auc']:.3f}"
         )
+        # NEW: initialise accumulators for smoothed, patient-specific metrics
+        smoothed_all_probs = []  # NEW
+        smoothed_all_labels = []  # NEW
+        smoothed_tp = smoothed_fp = smoothed_tn = smoothed_fn = 0  # NEW
+        smoothed_roc_auc = float("nan")  # NEW
+        smoothed_precision = float("nan")  # NEW
+        smoothed_recall = float("nan")  # NEW
+        smoothed_f1 = float("nan")  # NEW
     else:
         print("\nNo evaluation dataset available; skipping aggregate metrics.")
 
@@ -561,42 +692,122 @@ def run_training(args: argparse.Namespace) -> None:
     for patient_ds in eval_dataset.patient_datasets:
         loader = DataLoader(patient_ds, batch_size=args.batch_size, shuffle=False)
         loss, probs, labels = evaluate(model, loader, criterion, device)
-        per_metrics = summary(probs, labels)
+
+        # Raw (unsmoothed) per-patient metrics  # NEW
+        per_metrics_raw = summary(probs, labels)  # NEW
         preds_global = (probs >= global_threshold).astype(int) if probs.size else np.array([], dtype=int)
-        precision_g, recall_g, f1_g, _ = precision_recall_fscore_support(
-            labels, preds_global, average="binary", zero_division=0
-        ) if labels.size else (0.0, 0.0, 0.0, None)
+        if labels.size:  # NEW
+            labels_bin = (labels >= 0.5).astype(int)  # NEW
+            precision_g, recall_g, f1_g, _ = precision_recall_fscore_support(  # NEW
+                labels_bin, preds_global, average="binary", zero_division=0  # NEW
+            )  # NEW
+        else:  # NEW
+            labels_bin = np.array([], dtype=int)  # NEW
+            precision_g, recall_g, f1_g, _ = 0.0, 0.0, 0.0, None  # NEW
+
+        # Smoothed probabilities and patient-specific threshold  # NEW
+        time_seconds = patient_ds.starts.astype(float) / patient_ds.sample_rate  # NEW
+        smoothed_probs = smooth_probs(  # NEW
+            probs, time_seconds, args.smooth_window, args.smooth_half_life  # NEW
+        )  # NEW
+        if eval_loader is not None:  # NEW
+            smoothed_all_probs.append(smoothed_probs)  # NEW
+            smoothed_all_labels.append(labels)  # NEW
+
+        per_metrics_smooth = summary(smoothed_probs, labels)  # NEW
+        patient_threshold = per_metrics_smooth["threshold"]  # NEW
+        preds_patient = (smoothed_probs >= patient_threshold).astype(int) if smoothed_probs.size else np.array([], dtype=int)  # NEW
+
+        if labels_bin.size:  # NEW
+            # confusion components for this patient under smoothed, patient-specific threshold  # NEW
+            tp = int(((labels_bin == 1) & (preds_patient == 1)).sum())  # NEW
+            fp = int(((labels_bin == 0) & (preds_patient == 1)).sum())  # NEW
+            tn = int(((labels_bin == 0) & (preds_patient == 0)).sum())  # NEW
+            fn = int(((labels_bin == 1) & (preds_patient == 0)).sum())  # NEW
+            if eval_loader is not None:  # NEW
+                smoothed_tp += tp  # NEW
+                smoothed_fp += fp  # NEW
+                smoothed_tn += tn  # NEW
+                smoothed_fn += fn  # NEW
+
+            # per-patient F1 at patient-specific smoothed threshold  # NEW
+            prec_p = tp / (tp + fp) if (tp + fp) > 0 else 0.0  # NEW
+            rec_p = tp / (tp + fn) if (tp + fn) > 0 else 0.0  # NEW
+            f1_p = 2 * prec_p * rec_p / (prec_p + rec_p) if (prec_p + rec_p) > 0 else 0.0  # NEW
+        else:  # NEW
+            prec_p = rec_p = f1_p = 0.0  # NEW
 
         patient_id = patient_ds.patient_id if patient_ds.patient_id is not None else -1
-        plot_path = os.path.join(output_dir, f"beatdebug_patient_{patient_id}.png")
+        plot_path = os.path.join(output_dir, f"beatbot_patient_{patient_id}.png")
+        # Use the patient-specific threshold for the early-warning plot  # NEW
         first_alarm, lead_time, onset_time = plot_ew(
             patient_ds,
             probs,
-            global_threshold,
+            patient_threshold,  # NEW
             plot_path,
             smooth_window=args.smooth_window,
             smooth_half_life=args.smooth_half_life,
         )
 
         print(
-            f"Patient {patient_id}: loss={loss:.4f}  F1(global)={f1_g:.3f}  "
-            f"precision={precision_g:.3f}  recall={recall_g:.3f}  best_f1={per_metrics['f1']:.3f}"
-        )
+            f"Patient {patient_id}: loss={loss:.4f}  "
+            f"F1(global_raw)={f1_g:.3f}  precision_global_raw={precision_g:.3f}  recall_global_raw={recall_g:.3f}  "
+            f"best_f1_raw={per_metrics_raw['f1']:.3f}  "
+            f"F1(patient_smoothed)={f1_p:.3f}"
+        )  # NEW
 
         patient_reports[str(patient_id)] = {
             "loss": float(loss),
-            "best_threshold": per_metrics["threshold"],
-            "best_f1": per_metrics["f1"],
-            "precision_global": float(precision_g),
-            "recall_global": float(recall_g),
-            "f1_global": float(f1_g),
+            "best_threshold_raw": per_metrics_raw["threshold"],  # NEW
+            "best_f1_raw": per_metrics_raw["f1"],  # NEW
+            "roc_auc_raw": per_metrics_raw["roc_auc"],  # NEW
+            "patient_threshold_smoothed": float(patient_threshold),  # NEW
+            "best_f1_smoothed": float(per_metrics_smooth["f1"]),  # NEW
+            "roc_auc_smoothed": float(per_metrics_smooth["roc_auc"]),  # NEW
+            "precision_global_raw": float(precision_g),  # NEW
+            "recall_global_raw": float(recall_g),  # NEW
+            "f1_global_raw": float(f1_g),  # NEW
+            "f1_patient_smoothed": float(f1_p),  # NEW
             "first_alarm_seconds": first_alarm,
             "lead_time_seconds": lead_time,
             "onset_time_seconds": onset_time,
             "plot": plot_path,
         }
 
-    model_path = os.path.join(output_dir, "beatdebug_weights.pth")
+    # NEW: aggregate smoothed ROC-AUC (pooled windows) and global metrics under patient-specific thresholds
+    if eval_loader is not None:
+        if smoothed_all_probs:
+            agg_smoothed_probs = np.concatenate(smoothed_all_probs)  # NEW
+            agg_smoothed_labels = np.concatenate(smoothed_all_labels)  # NEW
+            smoothed_summary = summary(agg_smoothed_probs, agg_smoothed_labels)  # NEW
+            smoothed_roc_auc = smoothed_summary["roc_auc"]  # NEW
+
+        # NEW: derive global precision/recall/F1 from accumulated confusion matrix
+        total_tp = smoothed_tp  # NEW
+        total_fp = smoothed_fp  # NEW
+        total_tn = smoothed_tn  # NEW
+        total_fn = smoothed_fn  # NEW
+
+        if (total_tp + total_fp) > 0:  # NEW
+            smoothed_precision = total_tp / (total_tp + total_fp)  # NEW
+        else:  # NEW
+            smoothed_precision = 0.0  # NEW
+        if (total_tp + total_fn) > 0:  # NEW
+            smoothed_recall = total_tp / (total_tp + total_fn)  # NEW
+        else:  # NEW
+            smoothed_recall = 0.0  # NEW
+        if (smoothed_precision + smoothed_recall) > 0:  # NEW
+            smoothed_f1 = 2 * smoothed_precision * smoothed_recall / (smoothed_precision + smoothed_recall)  # NEW
+        else:  # NEW
+            smoothed_f1 = 0.0  # NEW
+
+        print("\nEvaluation (smoothed, patient-specific thresholds)")  # NEW
+        print(
+            f"F1={smoothed_f1:.3f}  precision={smoothed_precision:.3f}  "
+            f"recall={smoothed_recall:.3f}  ROC-AUC(smoothed)={smoothed_roc_auc:.3f}"
+        )  # NEW
+
+    model_path = os.path.join(output_dir, "beatbot_weights.pth")
     torch.save(model.state_dict(), model_path)
     print(f"Saved weights to {model_path}")
 
@@ -626,10 +837,22 @@ def run_training(args: argparse.Namespace) -> None:
         "aggregate": {
             "loss": aggregate_loss,
             "metrics": aggregate_metrics if aggregate_metrics is not None else None,
+            "metrics_raw": aggregate_metrics if aggregate_metrics is not None else None,  # NEW
+            "metrics_smoothed_patient": {  # NEW
+                "precision": float(smoothed_precision),  # NEW
+                "recall": float(smoothed_recall),  # NEW
+                "f1": float(smoothed_f1),  # NEW
+                "roc_auc_smoothed": float(smoothed_roc_auc),  # NEW
+                "threshold_strategy": "patient_specific",  # NEW
+                "smoothing": {  # NEW
+                    "window": int(args.smooth_window),  # NEW
+                    "half_life": float(args.smooth_half_life),  # NEW
+                },  # NEW
+            } if eval_loader is not None else None,  # NEW
         },
         "patients": patient_reports,
     }
-    meta_path = os.path.join(output_dir, "beatdebug_meta.json")
+    meta_path = os.path.join(output_dir, "beatbot_meta.json")
     with open(meta_path, "w") as f:
         import json
 
@@ -637,21 +860,23 @@ def run_training(args: argparse.Namespace) -> None:
     print(f"Saved metadata to {meta_path}")
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train and evaluate VTNETlite model.")
-    parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT, help="Directory containing Patient_*.h5 files.")
-    parser.add_argument("--train-patients", help="Comma-separated patient IDs to train on.")
-    parser.add_argument("--eval-patients", help="Comma-separated patient IDs to evaluate on.")
-    parser.add_argument("--eval-count", type=int, default=2, help="Default number of patients reserved for evaluation when lists not provided.")
-    parser.add_argument("--sliding-window", type=int, default=15 * 32, help="Window length in samples.")
-    parser.add_argument("--horizon", type=int, default=1920, help="Positive label horizon in samples.")
-    parser.add_argument("--step-size", type=int, default=None, help="Step between consecutive windows (defaults to window/4).")
-    parser.add_argument("--sample-rate", type=float, default=32.0, help="Sampling frequency in Hz.")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size.")
-    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
-    parser.add_argument("--smooth-window", type=int, default=0, help="Simple moving-average window (in windows).")
-    parser.add_argument("--smooth-half-life", type=float, default=0.0, help="Exponential smoothing half-life in seconds.")
+    parser = argparse.ArgumentParser(description="Train and evaluate VTNETlite model")
+    parser.add_argument("--data-root", default=DATAFOLDER, help="Directory containing Patient_*.h5 files")
+    parser.add_argument("--train-patients", help="Comma-separated patient IDs to train on")
+    parser.add_argument("--eval-patients", help="Comma-separated patient IDs to evaluate on")
+    parser.add_argument("--eval-count", type=int, default=2, help="Default number of patients reserved for evaluation")
+
+    parser.add_argument("--sliding-window", type=int, default=int(15.0 * SAMPLERATE), help="Window length in samples")
+    parser.add_argument("--horizon", type=int, default=HORIZON_SAMPLES, help="Positive label horizon in samples")
+    parser.add_argument("--step-size", type=int, default=None, help="Step between consecutive windows")
+    parser.add_argument("--sample-rate", type=float, default=SAMPLERATE, help="Sampling frequency in Hz")
+
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay")
+    parser.add_argument("--smooth-window", type=int, default=10, help="Simple moving-average window (in windows)")
+    parser.add_argument("--smooth-half-life", type=float, default=10.0, help="Exponential smoothing half-life in sec")
     return parser
 
 # ----------------------------------------------------------------------------------/
